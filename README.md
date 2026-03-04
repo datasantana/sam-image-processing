@@ -10,6 +10,7 @@ End-to-end pipeline for **semantic segmentation** of drone imagery, combining Me
 sam-image-processing/
 ├── README.md                              # This file
 ├── INSTRUCTIONS.md                        # Deep context for future work
+├── requirements.txt                       # Python dependencies
 └── notebooks/
     ├── automatic_mask_generator_example.ipynb   # SAM 2 auto-mask + COCO export
     └── semantic_segmentation_training.ipynb     # DeepLabv3+/PSPNet training
@@ -48,8 +49,8 @@ Trains pixel-level classification models on CVAT-exported masks. The notebook is
 
 #### Section 2 — Dataset Preparation
 - Pairs images with masks by matching base filenames.
-- Deterministic train/val split: first 53 pairs → training, remainder → validation.
-- No random shuffle — ensures reproducibility across runs.
+- Configurable train/val split: `TRAIN_RATIO` (default 0.8) with `RANDOM_SEED` (default 42) using `sklearn.model_selection.train_test_split`.
+- Reproducible across runs with a fixed random seed.
 
 #### Section 3 — Model Training Setup
 | Sub-section | What it does |
@@ -57,15 +58,17 @@ Trains pixel-level classification models on CVAT-exported masks. The notebook is
 | **3.1 Deep Learning Environment** | Installs PyTorch (CUDA 11.8), `segmentation-models-pytorch`, `albumentations`, `timm`, TensorBoard |
 | **3.2 Model Configuration** | Selects architecture (`DeepLabv3+` or `PSPNet`), backbone (`resnet18`–`resnet152`), and hyperparameters (batch size, LR, epochs, image size) |
 | **3.3 Class Labels & Label Map** | Parses `labelmap.txt` (supports `ClassName:R,G,B` format), builds RGB→class-index mapping, auto-detects whether masks are RGB or grayscale |
-| **3.4 Data Transforms & Dataset** | Custom `RGBSegmentationDataset` with pixel-wise RGB→index conversion; Albumentations augmentations (flips, rotations, brightness, noise); separate train/val transforms |
+| **3.4 Data Transforms & Dataset** | Custom `RGBSegmentationDataset` with vectorized 256³ LUT for RGB→index conversion (~10-50× faster than per-pixel loops); Albumentations augmentations (flips, rotations, brightness, noise); separate train/val transforms |
 | **3.5 Model Initialization** | Instantiates the model with ImageNet-pretrained encoder, DiceLoss, Adam optimizer, ReduceLROnPlateau scheduler |
 | **3.6 Forward Pass Test** | Validates the full pipeline (input → model → output) with `model.eval()` to avoid BatchNorm issues on single-sample batches |
 
 #### Section 4 — Training Loop & Visualization
 - Epoch-level training with `tqdm` progress bars.
-- Tracks **DiceLoss** and **IoU** (Intersection over Union) per epoch.
-- Saves the **best model** (by validation IoU) and the **final model** as `.pth` checkpoints containing model weights, optimizer state, scheduler state, class names, and architecture metadata.
-- Generates a 4-panel matplotlib figure: Train/Val Loss, Train/Val IoU, LR schedule, and a text summary.
+- Tracks **DiceLoss** and **per-class mean IoU (mIoU)** per epoch for accurate multi-class evaluation.
+- **Early stopping** halts training when validation mIoU stops improving for N epochs (`EARLY_STOPPING_PATIENCE`, default 10).
+- **Learning rate tracking** records actual LR per epoch for accurate schedule plots.
+- Saves the **best model** (by validation mIoU) and the **final model** as `.pth` checkpoints containing model weights, optimizer state, scheduler state, class names, and architecture metadata.
+- Generates a 4-panel matplotlib figure: Train/Val Loss, Train/Val mIoU, LR schedule history, and a text summary.
 
 #### Section 5 — Reusable Evaluation Metrics (Wilk et al. 2022–compatible)
 Provides benchmark-comparable evaluation using the four standard metrics from the semantic segmentation literature:
@@ -142,8 +145,8 @@ Azure Blob Storage
 CVAT exports masks where each class is encoded as a distinct RGB color. The notebook:
 1. Parses `labelmap.txt` to extract `ClassName:R,G,B` entries.
 2. Converts RGB triplets to BGR (OpenCV convention) for lookup.
-3. At training time, converts each pixel from BGR to a class index integer.
-4. Falls back to nearest-color matching when exact pixel colors aren't found in the map.
+3. Pre-builds a flat 256³ NumPy lookup table for O(1) vectorized per-pixel conversion.
+4. Falls back to vectorized nearest-color matching when exact pixel colors aren't found in the map.
 
 ---
 
@@ -165,6 +168,8 @@ CVAT exports masks where each class is encoded as a distinct RGB color. The note
 5. Download the saved `.pth` model checkpoint from `models/`.
 
 ## Dependencies
+
+See [requirements.txt](requirements.txt) for the full list. Key packages:
 
 ```
 azure-storage-blob >= 12.17.0

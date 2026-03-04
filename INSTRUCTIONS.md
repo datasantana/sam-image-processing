@@ -17,10 +17,10 @@ This document captures the architectural decisions, known limitations, and concr
 - No Python package / module structure — everything lives inside notebooks.
 - No inference script or deployment pipeline.
 - No CI/CD, linting, or automated testing.
-- No `requirements.txt` or `pyproject.toml`.
+- ~~No `requirements.txt` or `pyproject.toml`.~~ → `requirements.txt` added (2026-03-03).
 - No Dockerfile or reproducible environment beyond "run on Colab".
 - No model registry or versioned artifact storage.
-- No per-class IoU evaluation or confusion matrix.
+- ~~No per-class IoU evaluation or confusion matrix.~~ → Per-class mIoU in training loop + `SegmentationMetrics` class for post-training evaluation (2026-03-03).
 
 ---
 
@@ -56,54 +56,19 @@ CVAT exports masks as RGB images. Converting at training time keeps the raw data
 ## 3. Known Limitations & Technical Debt
 
 ### 3.1 Performance bottleneck: RGB mask conversion
-`RGBSegmentationDataset.rgb_to_class_indices()` iterates over every pixel with a Python `for` loop and falls back to Euclidean distance matching. On a 512×512 image this is ~262K iterations per sample.
 
-**Fix priority: HIGH**
-
-Recommended approach:
-```python
-def rgb_to_class_indices_vectorized(self, rgb_mask):
-    """Vectorized RGB→class conversion using a lookup table."""
-    # Build a flat lookup: hash BGR tuples to class indices
-    h, w, _ = rgb_mask.shape
-    flat = rgb_mask.reshape(-1, 3)
-    
-    # Create a unique hash per color: B*256^2 + G*256 + R
-    keys = flat[:, 0].astype(np.int64) * 65536 + flat[:, 1].astype(np.int64) * 256 + flat[:, 2].astype(np.int64)
-    
-    # Build hash→class mapping once
-    if not hasattr(self, '_color_lut'):
-        self._color_lut = {}
-        for bgr, cls_idx in self.rgb_to_class.items():
-            k = int(bgr[0]) * 65536 + int(bgr[1]) * 256 + int(bgr[2])
-            self._color_lut[k] = cls_idx
-    
-    class_mask = np.zeros(len(keys), dtype=np.uint8)
-    for i, k in enumerate(keys):
-        class_mask[i] = self._color_lut.get(k, 0)
-    
-    return class_mask.reshape(h, w)
-```
-
-Even better: pre-compute a full 256³ lookup NumPy array if the number of classes is small.
+> **✅ RESOLVED** (2026-03-03)
+> Replaced per-pixel Python loop with a pre-built 256³ NumPy lookup table (`_build_lookup_table()`) that converts the entire mask in a single vectorized indexing operation. The slow-path fallback now also uses vectorized broadcasting instead of nested loops. Expected ~10-50× speedup on 512×512 masks.
 
 ### 3.2 IoU calculation is binary, not per-class
-The current `calculate_iou()` treats all non-background pixels as a single class. This masks poor performance on minority classes.
 
-**Fix:** Use `smp.metrics.iou_score` or compute per-class IoU manually:
-```python
-per_class_iou = []
-for cls in range(NUM_CLASSES):
-    intersection = ((predicted == cls) & (target == cls)).sum().float()
-    union = ((predicted == cls) | (target == cls)).sum().float()
-    per_class_iou.append((intersection / (union + 1e-8)).item())
-mean_iou = np.mean(per_class_iou)
-```
+> **✅ RESOLVED** (2026-03-03)
+> Replaced `calculate_iou()` with `calculate_miou()` that computes IoU independently for each class and returns the mean. Training loop now reports per-class mean IoU (mIoU) instead of binary IoU.
 
 ### 3.3 No early stopping
-Training always runs for the full `NUM_EPOCHS`. If validation IoU stops improving, compute is wasted.
 
-**Fix:** Add an `EarlyStopping` callback that stops training if `val_iou` hasn't improved for N epochs.
+> **✅ RESOLVED** (2026-03-03)
+> Added `EARLY_STOPPING_PATIENCE` (default: 10 epochs). Training loop now tracks `epochs_without_improvement` and breaks early when patience is exhausted. Configurable via the `EARLY_STOPPING_PATIENCE` variable in the training cell.
 
 ### 3.4 Labelmap parsing is fragile
 The parser assumes `ClassName:R,G,B` format but does not handle headers, comments, or alternate delimiters. If the file starts with a header line (e.g., CVAT's default `label_name:r:g:b:a::` format), parsing silently produces wrong mappings.
@@ -116,9 +81,9 @@ There is no check that image dimensions match mask dimensions, that mask pixel v
 **Fix:** Add a pre-training validation pass that scans the full dataset and reports anomalies.
 
 ### 3.6 Learning rate plot is incorrect
-The LR plot in cell 26 plots a flat line (`optimizer.param_groups[0]['lr']` evaluated once after training). It should log the LR at each epoch during training.
 
-**Fix:** Append `current_lr` to a `learning_rates` list inside the training loop and plot that.
+> **✅ RESOLVED** (2026-03-03)
+> The training loop now appends `current_lr` to a `learning_rates` list at the start of each epoch. Cell 26 plots this list directly, showing the actual ReduceLROnPlateau schedule.
 
 ### 3.7 No standardized evaluation metrics (Wilk et al. 2022 comparison)
 The current pipeline only tracks a single binary IoU during training. It does **not** compute the four standard metrics used in the semantic segmentation literature — specifically the ones reported by Wilk et al. (2022) for UAV roof-type classification:
@@ -145,15 +110,19 @@ Implement a reusable `SegmentationMetrics` class + comparison utilities (see §1
 
 ### 4.1 Short-Term (next 1–2 iterations)
 
-| # | Improvement | Impact | Effort |
-|---|-------------|--------|--------|
-| 1 | **Vectorize RGB mask conversion** (§3.1) | 10–50× speedup on data loading | Low |
-| 2 | **Per-class IoU metrics** (§3.2) | Understand which classes the model struggles with | Low |
-| 3 | **Early stopping** (§3.3) | Save compute, reduce overfitting risk | Low |
-| 4 | **Fix LR plot** (§3.6) | Accurate training visualization | Trivial |
-| 5 | **Add `requirements.txt`** | Reproducible environment outside Colab | Trivial |
-| 6 | **Configurable train/val split ratio** | Flexible dataset partitioning | Low |
-| 6b | **Wilk et al. (2022) benchmark metrics** (§3.7, §12) | Comparable mIoU/OA/mAcc/mF1 + CSV export + comparison charts | Medium |
+All short-term improvements have been completed. See §4.4 Completed.
+
+### 4.4 Completed
+
+| # | Improvement | Status | Date |
+|---|-------------|--------|------|
+| 1 | **Vectorize RGB mask conversion** (§3.1) | ✅ Done — 256³ LUT in `_build_lookup_table()` | 2026-03-03 |
+| 2 | **Per-class IoU metrics** (§3.2) | ✅ Done — `calculate_miou()` replaces binary IoU | 2026-03-03 |
+| 3 | **Early stopping** (§3.3) | ✅ Done — `EARLY_STOPPING_PATIENCE` configurable | 2026-03-03 |
+| 4 | **Fix LR plot** (§3.6) | ✅ Done — `learning_rates` list tracked per epoch | 2026-03-03 |
+| 5 | **Add `requirements.txt`** | ✅ Done — root-level `requirements.txt` | 2026-03-03 |
+| 6 | **Configurable train/val split ratio** | ✅ Done — `TRAIN_RATIO` + `RANDOM_SEED` + `train_test_split` | 2026-03-03 |
+| 6b | **Wilk et al. (2022) benchmark metrics** (§3.7, §12) | ✅ Done — `SegmentationMetrics` class + CSV export + comparison charts | 2026-03-03 |
 
 ### 4.2 Medium-Term (next 3–5 iterations)
 
@@ -206,7 +175,7 @@ The current design uses `segmentation-models-pytorch` (SMP), which makes this st
 2. Update `LOCAL_IMG_DIR`, `LOCAL_MASK_DIR`, and `LOCAL_LABELMAP_DIR` in cell 6.
 3. Ensure the `labelmap.txt` follows the `ClassName:R,G,B` format (one class per line, no header).
 4. If masks are grayscale (pixel value = class index), the pipeline auto-detects this and skips RGB conversion.
-5. Adjust the train/val split index (currently hardcoded to 53) or implement a ratio-based split.
+5. The train/val split is controlled by `TRAIN_RATIO` (default 0.8) and `RANDOM_SEED` (default 42) in cell 8. Adjust as needed.
 
 ---
 
@@ -219,6 +188,9 @@ The current design uses `segmentation-models-pytorch` (SMP), which makes this st
 | `BATCH_SIZE` | `8` | `4`–`16` | Limited by GPU memory; reduce if OOM |
 | `LEARNING_RATE` | `1e-4` | `1e-5` to `5e-4` | Lower if training is unstable; higher if convergence is too slow |
 | `NUM_EPOCHS` | `50` | `30`–`150` | Use early stopping to find the right number |
+| `EARLY_STOPPING_PATIENCE` | `10` | `5`–`20` | Epochs without val mIoU improvement before stopping |
+| `TRAIN_RATIO` | `0.8` | `0.7`–`0.9` | Fraction of data for training (rest is validation) |
+| `RANDOM_SEED` | `42` | Any integer | Fixed seed for reproducible train/val split |
 | `IMAGE_SIZE` | `512` | `256`–`1024` | Larger = better detail but more memory; 512 is a solid default |
 | Augmentation strength | Moderate | — | Increase if overfitting; decrease if underfitting |
 | Loss function | DiceLoss | DiceLoss, FocalLoss, CE+Dice | Combined losses may improve boundary precision |
@@ -257,15 +229,15 @@ The current design uses `segmentation-models-pytorch` (SMP), which makes this st
 | 3 | Install deps | `pip install` commands |
 | 4 | Intro markdown | — |
 | 5–6 | Azure connection & download | `AZURE_CONN_STR`, `CONTAINER_NAME`, `download_blobs()` |
-| 7–8 | Dataset preparation | `image_files`, `mask_files`, `train_pairs`, `val_pairs`, `train_dataset`, `val_dataset` |
+| 7–8 | Dataset preparation | `TRAIN_RATIO`, `RANDOM_SEED`, `image_files`, `mask_files`, `train_pairs`, `val_pairs`, `train_dataset`, `val_dataset` |
 | 9–11 | DL env setup | PyTorch, SMP, albumentations install |
 | 12–13 | Model config | `MODEL_ARCH`, `BACKBONE`, `BATCH_SIZE`, `LEARNING_RATE`, `NUM_EPOCHS`, `IMAGE_SIZE` |
 | 14 | Beginner guide (Spanish) | Explains Loss, IoU, overfitting in plain language |
 | 15–16 | Label map & RGB detection | `class_names`, `NUM_CLASSES`, `rgb_to_class`, `class_to_idx` |
-| 17–18 | Dataset & transforms | `RGBSegmentationDataset`, `train_transforms`, `val_transforms`, `train_loader`, `val_loader` |
+| 17–18 | Dataset & transforms | `RGBSegmentationDataset` (vectorized LUT), `train_transforms`, `val_transforms`, `train_loader`, `val_loader` |
 | 19–20 | Model init | `model`, `criterion` (DiceLoss), `optimizer` (Adam), `scheduler` (ReduceLROnPlateau) |
 | 21–22 | Forward pass test | Validates shapes with `model.eval()` |
-| 23–24 | Training loop | `train_one_epoch()`, `validate_one_epoch()`, `calculate_iou()`, checkpoint saving |
+| 23–24 | Training loop | `train_one_epoch()`, `validate_one_epoch()`, `calculate_miou()`, `EARLY_STOPPING_PATIENCE`, `learning_rates`, checkpoint saving |
 | 25–26 | Visualization | matplotlib 4-panel figure, saved to `logs/training_results.png` |
 
 ### `notebooks/automatic_mask_generator_example.ipynb`
