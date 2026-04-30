@@ -127,14 +127,21 @@ Change C (architecture → DeepLabv3+) was applied in isolation before A and B. 
 |-----|--------|---------------|----|------|-----|-------|
 | 3 (50 epochs, patience 10) | 40/50 | 0.3738 | 70.9% | 44.7% | 46.5% | Early stopped; DiceLoss only |
 
-Key observations: mAcc gap vs. Wilk (44.7% vs 81.4%) confirms that DiceLoss alone cannot discriminate similar-texture classes (Ground/Road/Paved Surface). Strong augmentation still needed.
+**Results (2026-04-30, DeepLabv3+ + resnet50, Dice+CE unweighted + strong aug):**
 
-**Root causes:**
-1. **DiceLoss alone** lacks per-pixel discriminative gradients — it optimizes overlap but doesn't penalize confusing class A with class B at the pixel level.
-2. **Weak augmentation** — current transforms are conservative for a small dataset (~65 images); the model overfits.
-3. **Architecture** — PSPNet's pyramid pooling may not capture fine-grained class boundaries as well as DeepLabv3+'s ASPP.
+| Run | Epochs | Best val mIoU | OA | mAcc | mF1 | Notes |
+|-----|--------|---------------|----|------|-----|-------|
+| 4 (50 epochs, patience 10) | ~40/50 | 0.3800 | 74.6% | 46.6% | 48.4% | Early stopped; unweighted CE |
 
-> **✅ PARTIALLY RESOLVED** (2026-04-30). Changes A (combined Dice+CE loss) and B (stronger augmentation) applied in Cell 20 and Cell 18 respectively. Change C (DeepLabv3+) was already applied in Run 3. Full §14 recipe now active. Expected target: **0.42–0.50 mIoU**. Update this entry with actual results after the next training run.
+Key observations from Run 4: Unweighted `CrossEntropyLoss` was dominated by high-pixel classes (Road, Buildings, Vegetation). Minority classes regressed severely: Fence 83%→0%, Lightning Posts 78%→0%, Vehicle 41%→23%. The net mIoU gain was only +0.6% despite the combined loss. Root cause: CE without class weights makes rare classes invisible to the gradient.
+
+Additionally, `CoarseDropout(max_height=32, max_width=32)` erased small objects entirely (Lightning Posts, Vehicles are ~20px wide at 512px).
+
+**Run 5 fix (2026-04-30):**
+1. Replaced `nn.CrossEntropyLoss()` with `nn.CrossEntropyLoss(weight=class_weights)` where `class_weights` are computed by `compute_class_weights()` — inverse pixel frequency, normalized so mean weight = 1.0.
+2. Reduced `CoarseDropout` to `max_height=16, max_width=16, p=0.1`.
+
+> **✅ PARTIALLY RESOLVED** (2026-04-30, Run 5 changes applied). Expected target after Run 5: **0.44–0.48 mIoU**. Update this entry with actual results after the next training run.
 
 ---
 
