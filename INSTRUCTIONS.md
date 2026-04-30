@@ -119,19 +119,22 @@ Implement a reusable `SegmentationMetrics` class + comparison utilities (see §1
 | 1 (50 epochs, patience 10) | 50/50 | 0.3354 | No early stop |
 | 2 (100 epochs, patience 15) | 67/100 | 0.3609 | Early stopped at 67, best at 52 |
 
+**Intermediate results (2026-04-30, DeepLabv3+ + resnet50, DiceLoss only):**
+
+Change C (architecture → DeepLabv3+) was applied in isolation before A and B. Results show only marginal improvement because DiceLoss and weak augmentation remain the dominant bottlenecks.
+
+| Run | Epochs | Best val mIoU | OA | mAcc | mF1 | Notes |
+|-----|--------|---------------|----|------|-----|-------|
+| 3 (50 epochs, patience 10) | 40/50 | 0.3738 | 70.9% | 44.7% | 46.5% | Early stopped; DiceLoss only |
+
+Key observations: mAcc gap vs. Wilk (44.7% vs 81.4%) confirms that DiceLoss alone cannot discriminate similar-texture classes (Ground/Road/Paved Surface). Strong augmentation still needed.
+
 **Root causes:**
 1. **DiceLoss alone** lacks per-pixel discriminative gradients — it optimizes overlap but doesn't penalize confusing class A with class B at the pixel level.
 2. **Weak augmentation** — current transforms are conservative for a small dataset (~65 images); the model overfits.
 3. **Architecture** — PSPNet's pyramid pooling may not capture fine-grained class boundaries as well as DeepLabv3+'s ASPP.
 
-**Fix priority: HIGH**
-
-See §14 for the full implementation plan. The three changes should be applied together in one iteration:
-1. **Combined loss** (DiceLoss + CrossEntropyLoss) — §14.1
-2. **Stronger data augmentation** — §14.2
-3. **Switch default model to DeepLabv3+** — §14.3
-
-Expected target: **0.42–0.50 mIoU** (up from 0.36).
+> **✅ PARTIALLY RESOLVED** (2026-04-30). Changes A (combined Dice+CE loss) and B (stronger augmentation) applied in Cell 20 and Cell 18 respectively. Change C (DeepLabv3+) was already applied in Run 3. Full §14 recipe now active. Expected target: **0.42–0.50 mIoU**. Update this entry with actual results after the next training run.
 
 ---
 
@@ -139,22 +142,15 @@ Expected target: **0.42–0.50 mIoU** (up from 0.36).
 
 ### 4.1 Short-Term (next iteration) — Training Recipe Optimization
 
-> **Goal:** Raise mIoU from ~0.36 to ~0.42–0.50 by improving the loss function, augmentation, and default architecture. See §14 for the full implementation spec.
+> **✅ COMPLETED** (2026-04-30). All three §14 changes applied. Next target: reach ≥0.50 mIoU via §13.1 refinements (ASPP dilation tuning, boundary loss, resnet101 backbone).
 
-| # | Change | Cell(s) Affected | Impact | Effort |
+~~**Goal:** Raise mIoU from ~0.36 to ~0.42–0.50 by improving the loss function, augmentation, and default architecture. See §14 for the full implementation spec.~~
+
+| # | Change | Cell(s) Affected | Impact | Status |
 |---|--------|-------------------|--------|--------|
-| A | **Combined loss: DiceLoss + CrossEntropyLoss** (§14.1) | Cell 20 (Model Init) | +3–8% mIoU — provides per-pixel gradients for class discrimination | Low |
-| B | **Stronger data augmentation** (§14.2) | Cell 18 (Transforms) | +2–5% mIoU — regularizes small dataset, reduces overfitting | Low |
-| C | **Default architecture → DeepLabv3+** (§14.3) | Cell 13 (Model Config) | +1–4% mIoU — ASPP captures multi-scale context better | Trivial |
-
-**Safety constraints** (what must NOT change — see §14.4):
-- `calculate_miou()` function signature and behavior
-- `SegmentationMetrics` class and all post-training evaluation cells (29–35)
-- `learning_rates` tracking and LR plot
-- Early stopping logic
-- Checkpoint format (must remain loadable with `weights_only=False`)
-- `TRAIN_RATIO` / `RANDOM_SEED` split logic
-- Vectorized LUT in `RGBSegmentationDataset`
+| A | **Combined loss: DiceLoss + CrossEntropyLoss** (§14.1) | Cell 20 (Model Init) | +3–8% mIoU | ✅ Applied 2026-04-30 |
+| B | **Stronger data augmentation** (§14.2) | Cell 18 (Transforms) | +2–5% mIoU | ✅ Applied 2026-04-30 |
+| C | **Default architecture → DeepLabv3+** (§14.3) | Cell 13 (Model Config) | +1–4% mIoU | ✅ Applied 2026-04-30 (Run 3) |
 
 ### 4.4 Completed
 
@@ -167,6 +163,9 @@ Expected target: **0.42–0.50 mIoU** (up from 0.36).
 | 5 | **Add `requirements.txt`** | ✅ Done — root-level `requirements.txt` | 2026-03-03 |
 | 6 | **Configurable train/val split ratio** | ✅ Done — `TRAIN_RATIO` + `RANDOM_SEED` + `train_test_split` | 2026-03-03 |
 | 6b | **Wilk et al. (2022) benchmark metrics** (§3.7, §12) | ✅ Done — `SegmentationMetrics` class + CSV export + comparison charts | 2026-03-03 |
+| 7 | **§14.1 Combined loss: Dice + CE** | ✅ Done — `combined_loss()` in Cell 20; replaces `DiceLoss` only | 2026-04-30 |
+| 8 | **§14.2 Stronger data augmentation** | ✅ Done — `ShiftScaleRotate`, `HSV`, `GaussianBlur`, `CoarseDropout` in Cell 18 | 2026-04-30 |
+| 9 | **§14.3 Default architecture → DeepLabv3+** | ✅ Done — `MODEL_ARCH = "DeepLabv3+"` in Cell 13 | 2026-04-30 |
 
 ### 4.2 Medium-Term (next 3–5 iterations)
 
