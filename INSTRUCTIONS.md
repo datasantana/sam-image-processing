@@ -39,17 +39,17 @@ The team already stores drone imagery and CVAT exports in Azure. The notebook do
 ### 2.3 Why DiceLoss instead of CrossEntropy?
 DiceLoss directly optimizes the overlap metric and handles class imbalance better than pixel-wise cross-entropy for segmentation tasks where background dominates. The current implementation uses `smp.losses.DiceLoss(mode='multiclass')`.
 
-**Future direction:** Experiment with combined losses like `DiceLoss + FocalLoss` or `DiceLoss + CrossEntropy` for improved boundary precision.
+**Current limitation:** DiceLoss alone provides smooth overlap gradients but lacks pixel-level precision. After switching from binary IoU to per-class mIoU (§3.2), this became visible — the model achieves ~0.36 mIoU, well below the Wilk et al. (2022) baseline of 0.60. A combined loss is needed.
 
-### 2.4 Why a fixed train/val split (first 53)?
-The split is deterministic to ensure reproducibility. However, 53 is hardcoded and assumes a specific dataset size.
+**Planned change (§14.1):** Replace `DiceLoss` with `DiceLoss + CrossEntropyLoss` combined loss. CrossEntropy provides per-pixel gradients that help the model discriminate between similar classes; DiceLoss handles class imbalance. This is the standard approach in the segmentation literature.
 
-**Future direction:** Replace with a configurable ratio-based split (e.g., 80/20) using `sklearn.model_selection.train_test_split` with a fixed `random_state`.
+### 2.4 ~~Why a fixed train/val split (first 53)?~~ → Configurable split
 
-### 2.5 Why pixel-level RGB→index conversion at runtime?
-CVAT exports masks as RGB images. Converting at training time keeps the raw data intact and avoids a preprocessing step. The downside is significant overhead — the current `rgb_to_class_indices()` method uses nested Python loops over every pixel.
+> **✅ RESOLVED** (2026-03-03). Now uses `TRAIN_RATIO` (default 0.8) and `RANDOM_SEED` (42) with `sklearn.model_selection.train_test_split`.
 
-**Future direction:** Vectorize the conversion using NumPy broadcasting or pre-convert masks to index format offline and store them as single-channel PNGs.
+### 2.5 ~~Why pixel-level RGB→index conversion at runtime?~~ → Vectorized LUT
+
+> **✅ RESOLVED** (2026-03-03). Replaced per-pixel Python loop with a pre-built 256³ NumPy lookup table. See §3.1.
 
 ---
 
@@ -104,13 +104,57 @@ Implement a reusable `SegmentationMetrics` class + comparison utilities (see §1
 2. Adding a post-training evaluation section that runs the trained model on the full val set, computes per-class metrics, and exports results to CSV.
 3. Adding a benchmark comparison chart that overlays our results against Wilk et al. (2022).
 
+> **Partially resolved** (2026-03-03): `SegmentationMetrics` class, `evaluate_model()`, CSV export, confusion matrix, and Wilk comparison chart are all implemented in cells 29–35. Training loop uses `calculate_miou()` for per-class mIoU. Post-training evaluation cell uses `torch.load(..., weights_only=False)` for PyTorch 2.6+ compatibility (2026-03-04).
+
+### 3.8 Training recipe under-optimized for per-class mIoU
+
+**Discovered:** 2026-03-04, after switching from binary IoU to per-class mIoU (§3.2).
+
+**Context:** The old binary `calculate_iou()` reported ~0.64 IoU by treating all non-background pixels as one class. After replacing it with per-class `calculate_miou()`, the reported metric dropped to ~0.36 mIoU — not because the model got worse, but because the measurement is now honest. The model actually struggles to distinguish between the 14 roof-type classes.
+
+**Baseline results (2026-03-04, PSPNet + resnet50, DiceLoss only):**
+
+| Run | Epochs | Best mIoU | Notes |
+|-----|--------|-----------|-------|
+| 1 (50 epochs, patience 10) | 50/50 | 0.3354 | No early stop |
+| 2 (100 epochs, patience 15) | 67/100 | 0.3609 | Early stopped at 67, best at 52 |
+
+**Root causes:**
+1. **DiceLoss alone** lacks per-pixel discriminative gradients — it optimizes overlap but doesn't penalize confusing class A with class B at the pixel level.
+2. **Weak augmentation** — current transforms are conservative for a small dataset (~65 images); the model overfits.
+3. **Architecture** — PSPNet's pyramid pooling may not capture fine-grained class boundaries as well as DeepLabv3+'s ASPP.
+
+**Fix priority: HIGH**
+
+See §14 for the full implementation plan. The three changes should be applied together in one iteration:
+1. **Combined loss** (DiceLoss + CrossEntropyLoss) — §14.1
+2. **Stronger data augmentation** — §14.2
+3. **Switch default model to DeepLabv3+** — §14.3
+
+Expected target: **0.42–0.50 mIoU** (up from 0.36).
+
 ---
 
 ## 4. Recommended Future Improvements
 
-### 4.1 Short-Term (next 1–2 iterations)
+### 4.1 Short-Term (next iteration) — Training Recipe Optimization
 
-All short-term improvements have been completed. See §4.4 Completed.
+> **Goal:** Raise mIoU from ~0.36 to ~0.42–0.50 by improving the loss function, augmentation, and default architecture. See §14 for the full implementation spec.
+
+| # | Change | Cell(s) Affected | Impact | Effort |
+|---|--------|-------------------|--------|--------|
+| A | **Combined loss: DiceLoss + CrossEntropyLoss** (§14.1) | Cell 20 (Model Init) | +3–8% mIoU — provides per-pixel gradients for class discrimination | Low |
+| B | **Stronger data augmentation** (§14.2) | Cell 18 (Transforms) | +2–5% mIoU — regularizes small dataset, reduces overfitting | Low |
+| C | **Default architecture → DeepLabv3+** (§14.3) | Cell 13 (Model Config) | +1–4% mIoU — ASPP captures multi-scale context better | Trivial |
+
+**Safety constraints** (what must NOT change — see §14.4):
+- `calculate_miou()` function signature and behavior
+- `SegmentationMetrics` class and all post-training evaluation cells (29–35)
+- `learning_rates` tracking and LR plot
+- Early stopping logic
+- Checkpoint format (must remain loadable with `weights_only=False`)
+- `TRAIN_RATIO` / `RANDOM_SEED` split logic
+- Vectorized LUT in `RGBSegmentationDataset`
 
 ### 4.4 Completed
 
@@ -130,8 +174,8 @@ All short-term improvements have been completed. See §4.4 Completed.
 |---|-------------|--------|--------|
 | 7 | **Extract code into `src/` package** | Testable, reusable code; thin notebooks | Medium |
 | 8 | **Add a CLI inference script** | Run predictions without a notebook | Medium |
-| 9 | **Experiment with combined losses** (DiceLoss + FocalLoss) | Better boundary precision, minority class recall | Low–Medium |
-| 10 | **Add a confusion matrix visualization** | Visual per-class error analysis | Low |
+| 9 | ~~**Experiment with combined losses**~~ | → Promoted to §4.1-A (DiceLoss + CE) | — |
+| 10 | ~~**Add a confusion matrix visualization**~~ | → Already implemented in `plot_confusion_matrix()` (cell 33) | — |
 | 11 | **Mixed-precision training** (`torch.cuda.amp`) | ~2× speedup, lower GPU memory | Low |
 | 12 | **TensorBoard integration** (already installed, not wired) | Live training monitoring in Colab | Low |
 | 13 | **Abstract storage backend** | Support S3, GCS, local | Medium |
@@ -192,8 +236,10 @@ The current design uses `segmentation-models-pytorch` (SMP), which makes this st
 | `TRAIN_RATIO` | `0.8` | `0.7`–`0.9` | Fraction of data for training (rest is validation) |
 | `RANDOM_SEED` | `42` | Any integer | Fixed seed for reproducible train/val split |
 | `IMAGE_SIZE` | `512` | `256`–`1024` | Larger = better detail but more memory; 512 is a solid default |
-| Augmentation strength | Moderate | — | Increase if overfitting; decrease if underfitting |
-| Loss function | DiceLoss | DiceLoss, FocalLoss, CE+Dice | Combined losses may improve boundary precision |
+
+| Loss function | DiceLoss | DiceLoss, CE+Dice, FocalTversky | Combined Dice+CE is the recommended next step (§14.1) |
+| `LOSS_TYPE` (planned) | `"dice"` | `"dice"`, `"dice+ce"` | §14.1 — switch to `"dice+ce"` for better class discrimination |
+| Augmentation strength | Moderate | Moderate, Strong | §14.2 — `"strong"` uses ShiftScaleRotate, HSV, CoarseDropout |
 
 ---
 
@@ -235,7 +281,7 @@ The current design uses `segmentation-models-pytorch` (SMP), which makes this st
 | 14 | Beginner guide (Spanish) | Explains Loss, IoU, overfitting in plain language |
 | 15–16 | Label map & RGB detection | `class_names`, `NUM_CLASSES`, `rgb_to_class`, `class_to_idx` |
 | 17–18 | Dataset & transforms | `RGBSegmentationDataset` (vectorized LUT), `train_transforms`, `val_transforms`, `train_loader`, `val_loader` |
-| 19–20 | Model init | `model`, `criterion` (DiceLoss), `optimizer` (Adam), `scheduler` (ReduceLROnPlateau) |
+| 19–20 | Model init | `model`, `criterion` (DiceLoss; planned: Dice+CE §14.1), `optimizer` (Adam), `scheduler` (ReduceLROnPlateau) |
 | 21–22 | Forward pass test | Validates shapes with `model.eval()` |
 | 23–24 | Training loop | `train_one_epoch()`, `validate_one_epoch()`, `calculate_miou()`, `EARLY_STOPPING_PATIENCE`, `learning_rates`, checkpoint saving |
 | 25–26 | Visualization | matplotlib 4-panel figure, saved to `logs/training_results.png` |
@@ -1341,6 +1387,210 @@ if USE_OVERSAMPLING and MODEL_ARCH == "UnetPlusPlus":
 | `USE_OVERSAMPLING` | `False` | `True`/`False` | Enable for datasets with small/rare objects |
 | `RARE_BOOST` | `3.0` | `2.0`–`5.0` | Oversample factor; too high causes overfitting on rare tiles |
 | `RARE_CLASSES` | `None` (auto) | List of ints or `None` | Manually specify which classes to boost |
+
+---
+
+## 14. Training Recipe Optimization — Implementation Plan
+
+> **Status:** Planned (2026-03-04).
+> **Goal:** Raise per-class mIoU from ~0.36 to ~0.42–0.50 on 14-class drone/roof segmentation.
+> **Prerequisite:** All §4.4 Completed items are already in the notebook.
+
+This section specifies three changes to the training recipe. All three should be applied **together** in a single iteration — they are complementary and their effects compound.
+
+### 14.1 Change A: Combined Loss (DiceLoss + CrossEntropyLoss)
+
+#### What to change
+
+**Cell 20** (Model Initialization — the cell containing `criterion = smp.losses.DiceLoss(...)`).
+
+#### Why
+
+DiceLoss optimizes global overlap but does not penalize individual pixel misclassifications. When a pixel of class "flat roof" is predicted as "gable roof," DiceLoss only sees a slight overlap decrease. CrossEntropyLoss computes a per-pixel log-likelihood loss that directly penalizes this confusion. Together they provide both macro-level overlap optimization and micro-level class discrimination.
+
+#### Exact code change
+
+Replace:
+```python
+# Loss function - DiceLoss works well for segmentation
+criterion = smp.losses.DiceLoss(mode='multiclass')
+```
+
+With:
+```python
+# Loss function — Combined DiceLoss + CrossEntropyLoss
+# DiceLoss handles class imbalance (optimizes overlap metric)
+# CrossEntropyLoss provides per-pixel gradients (discriminates similar classes)
+# See INSTRUCTIONS.md §2.3, §3.8, §14.1 for rationale.
+dice_loss = smp.losses.DiceLoss(mode='multiclass')
+ce_loss = nn.CrossEntropyLoss()
+
+def combined_loss(pred, target):
+    """Combined Dice + CE loss for multi-class segmentation."""
+    return dice_loss(pred, target) + ce_loss(pred, target)
+
+criterion = combined_loss
+```
+
+#### What NOT to change in this cell
+
+- `optimizer` — keep `Adam(lr=1e-4, weight_decay=1e-4)`.
+- `scheduler` — keep `ReduceLROnPlateau(mode='min', factor=0.5, patience=5)`. It monitors `val_loss`; the combined loss is still a scalar that decreases when the model improves.
+- Print statements — update the loss description line to read `"DiceLoss + CrossEntropyLoss (combined)"`.
+
+#### Interaction with other cells
+
+- **Training loop (cell 24):** No change needed. The loop calls `criterion(outputs, masks)` — this works identically whether `criterion` is a function, a `nn.Module`, or a lambda.
+- **Checkpoint format:** No change. The checkpoint stores `model_state_dict` and `optimizer_state_dict`, not the loss function.
+- **Post-training evaluation (cell 35):** No change. Evaluation uses `SegmentationMetrics`, not the loss function.
+
+---
+
+### 14.2 Change B: Stronger Data Augmentation
+
+#### What to change
+
+**Cell 18** (Data Transforms and Dataset — the cell containing `train_transforms = A.Compose([...])`).
+
+#### Why
+
+With ~65 training images, the model overfits quickly. The current augmentations (flip, rotate90, mild brightness/contrast, mild noise) are conservative. Drone imagery benefits from:
+- **ShiftScaleRotate** — simulates camera angle variations and zoom.
+- **HueSaturationValue** — handles lighting/color temperature variability across flight sessions.
+- **OneOf** blocks — apply exactly one augmentation from a set, adding diversity without stacking too many distortions.
+- **CoarseDropout** — simulates occlusions and forces the model to use context.
+
+#### Exact code change
+
+Replace the `train_transforms` definition:
+```python
+train_transforms = A.Compose([
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.3),
+    A.RandomRotate90(p=0.5),
+    A.RandomBrightnessContrast(p=0.3),
+    A.RandomGamma(p=0.3),
+    A.GaussNoise(p=0.2),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+```
+
+With:
+```python
+train_transforms = A.Compose([
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=30, p=0.5),
+    A.OneOf([
+        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=1.0),
+        A.RandomGamma(gamma_limit=(70, 130), p=1.0),
+        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=1.0),
+    ], p=0.5),
+    A.OneOf([
+        A.GaussNoise(var_limit=(10, 50), p=1.0),
+        A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+    ], p=0.3),
+    A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.2),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+```
+
+#### What NOT to change in this cell
+
+- `val_transforms` — validation transforms must stay unchanged (Resize + Normalize + ToTensorV2 only). Augmenting validation data would invalidate metrics.
+- `RGBSegmentationDataset` class — no changes. Albumentations handles masks automatically via the `mask=mask` kwarg.
+- `DataLoader` creation — no changes to batch size, num_workers, or pin_memory.
+- Data loading test block — no changes.
+
+#### Interaction with other cells
+
+- **albumentations API:** All transforms used (`ShiftScaleRotate`, `OneOf`, `HueSaturationValue`, `GaussianBlur`, `CoarseDropout`) are available in `albumentations>=1.3.0` which is already installed.
+- **Mask consistency:** All spatial transforms (flip, rotate, shift/scale) are automatically applied to both `image` and `mask` by `A.Compose`. Color transforms only affect the image (they ignore the mask channel). `CoarseDropout` drops rectangular regions from images only by default — masks are unaffected unless `mask_fill_value` is set.
+
+---
+
+### 14.3 Change C: Default Architecture → DeepLabv3+
+
+#### What to change
+
+**Cell 13** (Model Configuration — the line `MODEL_ARCH = "PSPNet"`).
+
+#### Why
+
+DeepLabv3+'s ASPP (Atrous Spatial Pyramid Pooling) module applies parallel dilated convolutions at multiple rates, capturing both local detail and global context. For fine-grained multi-class segmentation (14 roof types with varying sizes), this typically outperforms PSPNet's fixed-size pyramid pooling. The SMP library handles all architecture differences internally.
+
+#### Exact code change
+
+Replace:
+```python
+MODEL_ARCH = "PSPNet"  # Options: "DeepLabv3+", "PSPNet"
+```
+
+With:
+```python
+MODEL_ARCH = "DeepLabv3+"  # Options: "DeepLabv3+", "PSPNet"
+```
+
+#### What NOT to change
+
+- **Everything else in the cell** — `BACKBONE`, `BATCH_SIZE`, `LEARNING_RATE`, `NUM_EPOCHS`, `IMAGE_SIZE`, `NUM_WORKERS`, device config, and output directories must remain unchanged.
+- **The `if/elif` branching logic** — it already handles `"DeepLabv3+"` correctly and maps to `smp.DeepLabV3Plus`.
+
+#### Interaction with other cells
+
+- **Model Initialization (cell 20):** The `model_class(encoder_name=..., ...)` call is architecture-agnostic. No change needed.
+- **Forward pass test (cell 22):** Works for any SMP model. No change needed.
+- **Training loop (cell 24):** Architecture-agnostic. No change needed.
+- **Checkpoint naming:** Uses `MODEL_ARCH` in the filename (e.g., `best_DeepLabv3+_resnet50_epoch_X.pth`), which automatically updates.
+- **Post-training evaluation (cell 35):** Architecture-agnostic. No change needed.
+- **Wilk comparison chart:** Uses `MODEL_ARCH` in the legend label automatically.
+
+---
+
+### 14.4 Safety Constraints — What Must NOT Break
+
+Any contributor implementing §14.1–14.3 **must verify** the following invariants hold after their changes:
+
+| Invariant | How to verify |
+|-----------|---------------|
+| `calculate_miou(predicted, target, num_classes)` returns a float in [0, 1] | Training loop prints mIoU per epoch; should not be NaN or >1 |
+| `SegmentationMetrics.compute()` returns dict with keys `mIoU`, `OA`, `mAcc`, `mF1`, `per_class`, `confusion_matrix` | Post-training evaluation cell (35) prints all metrics |
+| `learning_rates` list has exactly `len(train_losses)` entries | Visualization cell (26) plots LR curve without IndexError |
+| Early stopping triggers when `epochs_without_improvement >= EARLY_STOPPING_PATIENCE` | Check training output shows `🛑 Early stopping triggered` when plateau is long enough |
+| Checkpoint loads with `torch.load(path, map_location=device, weights_only=False)` | Post-training evaluation cell (35) loads without error |
+| `train_test_split(pairs, train_size=TRAIN_RATIO, random_state=RANDOM_SEED)` produces the same split on rerun | First 3 filenames in `train_pairs` should be identical across runs with same seed |
+| Mask conversion uses vectorized LUT path (not Python loops) | Data loading test in cell 18 completes in <5 seconds |
+| CSV exports (`metrics_per_class.csv`, `metrics_summary.csv`) contain valid data | Check files exist in `logs/` and contain numeric values |
+
+### 14.5 Expected Results
+
+| Config | mIoU (estimated) | Notes |
+|--------|-------------------|-------|
+| Current (PSPNet, DiceLoss, moderate aug) | 0.36 | Baseline measured 2026-03-04 |
+| +Combined loss only | 0.39–0.44 | Biggest single lever |
+| +Combined loss + strong aug | 0.41–0.47 | Better generalization on small dataset |
+| +Combined loss + strong aug + DeepLabv3+ | **0.42–0.50** | Full recipe; target for this iteration |
+| Wilk et al. (2022) image baseline | 0.603 | Long-term target; may require more data or advanced techniques from §13 |
+
+### 14.6 Post-Implementation Checklist
+
+After applying all three changes and running a full training cycle on Colab:
+
+- [ ] Training completes without errors (all cells run)
+- [ ] Best mIoU > 0.40 (improved over 0.36 baseline)
+- [ ] Post-training evaluation cell produces metrics CSV and comparison charts
+- [ ] Confusion matrix shows improved diagonal density
+- [ ] LR plot shows actual scheduler steps (not a flat line)
+- [ ] Early stopping triggers at a reasonable epoch (not too early, not at max)
+- [ ] Update §3.8 in INSTRUCTIONS.md with new baseline results
+- [ ] Move §4.1 items A/B/C to §4.4 Completed table
+- [ ] Update §7 hyperparameter table with actual values used
+- [ ] Update §9 cell references if any cells were added or reordered
 
 #### 13.3.4 Metrics Integration
 
