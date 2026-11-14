@@ -80,7 +80,9 @@ def build_pack(dirpath: Path, n=12, seed=0, positions=None):
         "layout": {"classes": "classes.json", "manifest": "manifest.csv", "class_stats": "class_stats.csv"},
         "classes": {"ignore": ["background"]},
         "geometry": {"lat": "GpsLatitude", "lon": "GpsLongitude", "height": "RelativeAltitude",
-                     "pitch": "GimbalPitchDegree", "yaw": "GimbalYawDegree"},
+                     "pitch": "GimbalPitchDegree", "yaw": "GimbalYawDegree", "roll": "GimbalRollDegree",
+                     "camera": {"focal_mm": 6.72, "pixel_mm": 0.0026187585746188587, "width": 4032,
+                                "height": 2268, "max_range_m": 400}},
     }
     return zpath, cfg
 

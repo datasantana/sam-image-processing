@@ -81,3 +81,64 @@ def test_save_and_report(tmp_path):
     assert (tmp_path / "fold0.csv").exists()
     txt = S.format_report([S.split_report(f, presence, ["Road", "Fence"]) for f in folds])
     assert "fotos por clase en test" in txt
+
+
+CAM = {"focal_mm": 6.72, "pixel_mm": 0.0026187585746188587, "width": 4032, "height": 2268, "max_range_m": 400}
+
+
+def test_camera_fov_and_footprint_geometry():
+    hf, vf = S.camera_fov(CAM)
+    assert hf == pytest.approx(76.3, abs=0.1) and vf == pytest.approx(47.7, abs=0.1)
+    rows = rows_from_xy([(0, 0)], yaw=0.0, pitch=-45.0, h=58.7)
+    for r in rows:
+        r["GimbalRollDegree"] = 0
+    poly = S.footprint_polygons(rows, {**GEOM, "camera": CAM})[0]
+    # yaw 0 → la huella mira al norte; borde cercano a h/tan(45+vf/2), lejano a h/tan(45-vf/2)
+    near = 58.7 / math.tan(math.radians(45 + vf / 2))
+    far = 58.7 / math.tan(math.radians(45 - vf / 2))
+    assert poly[2, 1] == pytest.approx(near, abs=0.5) and poly[0, 1] == pytest.approx(far, abs=0.5)
+    assert abs(poly[0, 0] - poly[1, 0]) > abs(poly[3, 0] - poly[2, 0])  # trapecio: más ancho lejos
+    cx, cy = S.polygon_centroid(poly)
+    assert cx == pytest.approx(0, abs=1e-6) and cy > 58.7  # centroide más lejos que el rayo central
+    fx, fy, _, _ = S.footprint_centers(rows, {**GEOM, "camera": CAM})
+    assert fy[0] == pytest.approx(cy, abs=0.5)
+
+
+def test_overlap_raster():
+    sq = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], float)
+    polys = np.stack([sq, sq + [5, 0], sq + [100, 0]])
+    r = S.FootprintRaster(polys, res_m=0.5)
+    assert r.covered_pct([0], [0]) == pytest.approx(100)
+    assert r.covered_pct([0], [1]) == pytest.approx(50, abs=3)
+    assert r.covered_pct([0], [2]) == 0
+
+
+def test_folds_report_leakage_and_buffer_variant_keeps_test():
+    rng = np.random.default_rng(5)
+    rows = rows_from_xy(rng.uniform(0, 800, size=(60, 2)))
+    for r in rows:
+        r["GimbalYawDegree"] = float(rng.uniform(-180, 180)); r["GimbalRollDegree"] = 0
+    geom = {**GEOM, "camera": CAM}
+    f50 = S.make_folds(rows, geom, k=4, block_m=150, buffer_m=50)
+    fp = S.footprints(rows, geom)
+    f75 = S.folds_from_assignment([r["name"] for r in rows], fp, S.fold_assignment(f50), 4, 75)
+    for a, b in zip(f50, f75):
+        assert a.test == b.test and a.val == b.val
+        assert set(b.train) <= set(a.train)
+        assert b.min_dist_train_test >= 75 and a.min_dist_train_test >= 50
+        assert 0 <= a.overlap_train_test_pct <= 100 and b.overlap_train_test_pct <= a.overlap_train_test_pct + 1e-9
+
+
+def test_blocks_ignore_flight_date():
+    # dos "vuelos" sobre el mismo terreno: mismas posiciones, fechas distintas en el nombre
+    xy = [(x * 200.0, y * 200.0) for x in range(3) for y in range(2)]
+    rows = rows_from_xy(xy + xy)
+    for i, r in enumerate(rows):
+        r["name"] = f"DJI_{'20250522' if i < 6 else '20250611'}1111{i:02d}_D"
+    fx, fy, _, _ = S.footprint_centers(rows, GEOM)
+    mix = S.flight_mix([r["name"] for r in rows], fx, fy, 150)
+    assert mix["n_blocks"] == 6 and mix["blocks_with_several_groups"] == 6
+    folds = S.make_folds(rows, GEOM, k=3, block_m=150, buffer_m=0)
+    fa = S.fold_assignment(folds)
+    for i in range(6):
+        assert fa[rows[i]["name"]] == fa[rows[i + 6]["name"]]

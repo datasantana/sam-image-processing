@@ -34,9 +34,20 @@ classes:
   ignore: [background]
 
 geometry:
-  # Columnas del manifest usadas para el centro de huella aproximado de la cámara oblicua.
+  # Columnas del manifest usadas para proyectar la huella de la cámara oblicua.
   lat: GpsLatitude
   lon: GpsLongitude
   height: RelativeAltitude
   pitch: GimbalPitchDegree
   yaw: GimbalYawDegree
+  roll: GimbalRollDegree
+  # Calibración de Metashape (FOV ≈ 76.3° × 47.7°). Huella = 4 esquinas proyectadas a un plano a
+  # RelativeAltitude bajo el dron; centro = centroide del polígono.
+  camera:
+    focal_mm: 6.72
+    pixel_mm: 0.0026187585746188587
+    width: 4032
+    height: 2268
+    max_range_m: 400
+  # Agrupación por vuelo solo para diagnóstico (no se usa para formar bloques).
+  flight_regex: "DJI_(\\d{8})"
