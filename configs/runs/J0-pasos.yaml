@@ -1,0 +1,9 @@
+# Control fuera de la escalera: J0 con el MISMO presupuesto de pasos de optimización que J1.
+# J1 cambia dos cosas a la vez: resolución (recortes nativos) y número de pasos (880 muestras/época
+# = 110 pasos de 8 vs ~4 pasos/época en J0). J0-pasos usa 880 muestras/época con Resize 512
+# (fotos repetidas en ciclo, cada una con su aumento), así que J0-pasos → J1 aísla la resolución.
+# Máximo de pasos en ambos: 50 épocas × 110 = 5500. Los pasos reales (early stopping) quedan en el log.
+base: J0.yaml
+description: "J0 con 880 muestras/época (mismo presupuesto de pasos que J1)"
+data:
+  samples_per_epoch: 880

@@ -20,7 +20,7 @@ DEFAULTS: dict[str, Any] = {
         "mode": "resize",            # resize | crops
         "resize": 512,
         "crop": 1024,
-        "samples_per_epoch": None,   # solo crops; None = nº de fotos de train
+        "samples_per_epoch": None,   # None = nº de fotos de train (una pasada); en resize, las fotos se repiten en ciclo
         "scale_range": None,         # crops: [min, max] reescalado aleatorio de la foto antes de recortar
         "sampler": "uniform",        # uniform | rare
         "rare_p": 0.5,
@@ -44,6 +44,7 @@ DEFAULTS: dict[str, Any] = {
         "grad_clip": None,
     },
     "eval": {"min_photos": 5, "n_boot": 2000},
+    "split": {"buffer_m": None},     # None = buffer del estudio; otro valor = misma asignación de bloques, otro buffer
 }
 
 
@@ -74,6 +75,7 @@ def load_run_config(path: str | Path, overrides: Optional[dict] = None, _seen: O
         cfg = deep_merge(cfg, overrides)
     cfg["name"] = raw.get("name") or path.stem   # el nombre nunca se hereda de la base
     cfg["base"] = base
+    cfg["reference"] = raw.get("reference")
     return cfg
 
 
@@ -85,7 +87,7 @@ def diff(a: dict, b: dict, prefix: str = "") -> list[str]:
     """Lista legible de diferencias (para documentar el 'un solo cambio' de cada paso)."""
     out = []
     for k in sorted(set(a) | set(b)):
-        if not prefix and k in ("name", "description", "base"):
+        if not prefix and k in ("name", "description", "base", "reference"):
             continue
         p = f"{prefix}{k}"
         va, vb = a.get(k), b.get(k)

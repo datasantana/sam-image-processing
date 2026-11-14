@@ -217,6 +217,7 @@ def train_run(cfg: dict, store: PhotoStore, split: dict, run_dir: str | Path, se
         start_epoch, best, bad, history = ck["epoch"] + 1, ck["best"], ck["bad_epochs"], ck["history"]
         set_rng_state(ck["rng"])
         log(f"[resume] {run_dir.name}: continúa en la época {start_epoch + 1} (mejor {select}={best:.4f})")
+    opt_steps = int(history[-1]["opt_steps"]) if history else 0   # pasos de optimización acumulados
 
     epochs = int(cfg["train"]["epochs"])
     patience = int(cfg["train"]["patience"])
@@ -231,7 +232,7 @@ def train_run(cfg: dict, store: PhotoStore, split: dict, run_dir: str | Path, se
         g = torch.Generator().manual_seed(int(np.random.SeedSequence([seed, epoch]).generate_state(1)[0]))
         loader = torch.utils.data.DataLoader(ds, shuffle=cfg["data"]["mode"] == "resize", generator=g, **loader_kw)
         lr = opt.param_groups[0]["lr"]
-        tot, nb = 0.0, 0
+        tot, nb, n_samples = 0.0, 0, 0
         opt.zero_grad(set_to_none=True)
         for it, (x, y) in enumerate(loader):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -247,10 +248,14 @@ def train_run(cfg: dict, store: PhotoStore, split: dict, run_dir: str | Path, se
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
+                opt_steps += 1
                 if sched is not None and cfg["sched"]["name"] == "poly":
                     sched.step()
-            tot += float(loss.detach()); nb += 1
+            tot += float(loss.detach()); nb += 1; n_samples += len(x)
         train_loss = tot / max(1, nb)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_train = time.time() - t0
 
         cms, val_loss = evaluate_photos(model, store, val_names, cfg, device, amp_dtype, criterion, C)
         vs = val_summary(cms, sel_min)
@@ -266,6 +271,8 @@ def train_run(cfg: dict, store: PhotoStore, split: dict, run_dir: str | Path, se
             bad += 1
         rec = {"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss, "val_mIoU": vs["mIoU"],
                "val_min_iou": vs["min_iou"], "val_OA": vs["OA"], "lr": lr, "seconds": time.time() - t0,
+               "train_seconds": t_train, "val_seconds": time.time() - t0 - t_train,
+               "n_train_samples": n_samples, "n_val": len(val_names), "opt_steps": opt_steps,
                "best": best, "improved": bool(improved),
                **{f"val_iou_{n}": v for n, v in zip(schema.names, vs["class_iou"])}}
         history.append(rec)
@@ -276,7 +283,7 @@ def train_run(cfg: dict, store: PhotoStore, split: dict, run_dir: str | Path, se
         _write_log(run_dir / "epoch_log.csv", history)
         log(f"[{run_dir.parent.parent.name}/{run_dir.parent.name}/{run_dir.name}] época {epoch + 1}/{epochs} "
             f"loss {train_loss:.4f} | val loss {val_loss:.4f} mIoU {vs['mIoU']:.4f} min {vs['min_iou']:.4f} | "
-            f"lr {lr:.2e} | {rec['seconds']:.0f}s" + (" *" if improved else ""))
+            f"lr {lr:.2e} | pasos {opt_steps} | {rec['seconds']:.0f}s (train {t_train:.0f}s)" + (" *" if improved else ""))
         if stop_after_epochs is not None and epoch + 1 >= stop_after_epochs and epoch + 1 < epochs:
             raise Interrupted(f"interrupción simulada tras la época {epoch + 1}")
 
@@ -287,7 +294,13 @@ def train_run(cfg: dict, store: PhotoStore, split: dict, run_dir: str | Path, se
     model.load_state_dict(bk["model"])
     ev = cfg["eval"]
     result = {"run_dir": str(run_dir), "seed": seed, "best_epoch": bk["epoch"] + 1, "select": select,
-              "select_value": bk["value"], "epochs_trained": len(history)}
+              "select_value": bk["value"], "epochs_trained": len(history),
+              "optimizer_steps_total": int(history[-1]["opt_steps"]) if history else 0,
+              "optimizer_steps_at_best": int(history[bk["epoch"]]["opt_steps"]) if history else 0,
+              "train_hours": sum(float(h["seconds"]) for h in history) / 3600,
+              "buffer_m": split.get("buffer_m"),
+              "min_dist_train_test_m": split.get("min_dist_train_test_m"),
+              "overlap_train_test_pct": split.get("overlap_train_test_pct")}
     for part, names in (("val", val_names), ("test", test_names)):
         cms, _ = evaluate_photos(model, store, names, cfg, device, amp_dtype, None, C)
         (run_dir / part).mkdir(exist_ok=True)
@@ -306,9 +319,9 @@ def train_run(cfg: dict, store: PhotoStore, split: dict, run_dir: str | Path, se
 
 def _write_log(path: Path, history: list[dict]) -> None:
     buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=list(history[0].keys()))
+    w = csv.DictWriter(buf, fieldnames=list(history[0].keys()), lineterminator="\n")
     w.writeheader()
     w.writerows(history)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(buf.getvalue(), encoding="utf-8")
+    tmp.write_text(buf.getvalue(), encoding="utf-8", newline="")
     os.replace(tmp, path)

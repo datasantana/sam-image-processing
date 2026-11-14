@@ -30,7 +30,7 @@ def collect(study_dir: str | Path, configs: Iterable[str]) -> dict:
         cdir = study_dir / "runs" / c
         for sdir in sorted(cdir.glob("seed*")) if cdir.exists() else []:
             seed = int(sdir.name[4:])
-            parts = []
+            parts, dones = [], []
             for f in range(n_folds):
                 p = sdir / f"fold{f}" / "test" / "photo_confusion.npz"
                 if not (sdir / f"fold{f}" / "DONE.json").exists() or not p.exists():
@@ -38,11 +38,12 @@ def collect(study_dir: str | Path, configs: Iterable[str]) -> dict:
                     break
                 z = np.load(p, allow_pickle=False)
                 parts.append((z["cms"], [str(n) for n in z["names"]]))
+                dones.append(json.loads((sdir / f"fold{f}" / "DONE.json").read_text(encoding="utf-8")))
             else:
                 cms = np.concatenate([a for a, _ in parts])
                 names = [n for _, ns in parts for n in ns]
                 order = np.argsort(names)
-                out.setdefault(c, {})[seed] = (cms[order], [names[i] for i in order])
+                out.setdefault(c, {})[seed] = (cms[order], [names[i] for i in order], dones)
     return {"runs": out, "missing": missing, "params": params}
 
 
@@ -58,8 +59,26 @@ def _metric_seed_mean(cms_by_seed: list[np.ndarray], idx: np.ndarray, ev: np.nda
     return {**{k: float(np.mean(v)) for k, v in vals.items()}, "class_iou": np.nanmean(np.stack(ious), 0)}
 
 
+LADDER = ["J0", "J1", "J2", "J3"]
+
+
+def default_pairs(configs: list[str], reference: str = "J0") -> list[tuple[str, str]]:
+    """Escalera consecutiva (J0→J1→J2→J3), cada extra vs J0 y el control de pasos J0-pasos → J1."""
+    lad = [c for c in LADDER if c in configs]
+    pairs = list(zip(lad, lad[1:]))
+    for c in configs:
+        if c not in lad and reference in configs:
+            pairs.append((reference, c))
+    if "J0-pasos" in configs and "J1" in configs:
+        pairs.append(("J0-pasos", "J1"))   # mismo presupuesto de pasos: aísla el efecto de la resolución
+    if "M-b3" in configs and "J3" in configs:
+        pairs.append(("J3", "M-b3"))
+    return list(dict.fromkeys(pairs))
+
+
 def build(study_dir: str | Path, configs: Iterable[str], reference: Optional[str] = "J0",
-          n_boot: int = 2000, seed: int = 0, out_dir: Optional[str | Path] = None) -> dict:
+          n_boot: int = 2000, seed: int = 0, out_dir: Optional[str | Path] = None,
+          pairs: Optional[list[tuple[str, str]]] = None) -> dict:
     study_dir = Path(study_dir)
     configs = list(configs)
     col = collect(study_dir, configs)
@@ -91,8 +110,15 @@ def build(study_dir: str | Path, configs: Iterable[str], reference: Optional[str
         per_seed_iou = np.stack([M.per_class(cms.sum(0))["iou"] for cms in cms_by_seed])
         boots = [_metric_seed_mean(cms_by_seed, ix, ev) for ix in idx_boot]
         boot_cache[c] = boots
+        dn = [d for s in seeds for d in runs[c][s][2]]
+        mean = lambda k: float(np.mean([d[k] for d in dn if d.get(k) is not None])) if any(d.get(k) is not None for d in dn) else None
         row = {"config": c, "n_seeds": len(seeds), "seeds": seeds, "n_photos": N,
-               "not_evaluable": [n for n, e in zip(classes, ev) if not e]}
+               "not_evaluable": [n for n, e in zip(classes, ev) if not e],
+               "steps_total": mean("optimizer_steps_total"), "steps_at_best": mean("optimizer_steps_at_best"),
+               "epochs_trained": mean("epochs_trained"), "gpu_hours": float(sum(d.get("train_hours", 0) for d in dn)),
+               "buffer_m": mean("buffer_m"), "overlap_train_test_pct": mean("overlap_train_test_pct"),
+               "min_dist_train_test_m": min((d["min_dist_train_test_m"] for d in dn
+                                             if d.get("min_dist_train_test_m") is not None), default=None)}
         for k in KEYS:
             v = np.array([s[k] for s in per_seed])
             b = np.array([bb[k] for bb in boots])
@@ -112,9 +138,7 @@ def build(study_dir: str | Path, configs: Iterable[str], reference: Optional[str
                                  if np.isfinite(bci[:, j]).any() else None})
 
     done = [r["config"] for r in rows]
-    pairs = [(done[i - 1], done[i]) for i in range(1, len(done))]
-    if reference in done:
-        pairs += [(reference, c) for c in done if c != reference and (reference, c) not in pairs]
+    pairs = [(a, b) for a, b in (pairs or default_pairs(done, reference)) if a in done and b in done]
     for a, b in pairs:
         d = np.array([bb["mIoU"] for bb in boot_cache[b]]) - np.array([aa["mIoU"] for aa in boot_cache[a]])
         ra = next(r for r in rows if r["config"] == a); rb = next(r for r in rows if r["config"] == b)
@@ -151,10 +175,13 @@ def to_markdown(result: dict) -> str:
          f"{result['params']['block_m']} m, buffer {result['params']['buffer_m']} m). "
          f"Valores en %: media ± DE entre semillas [IC 95 % bootstrap de fotos, n={result['n_boot']}]. "
          f"mIoU/mAcc/mF1 excluyen clases con < {result['K']} fotos (no evaluables).", "",
-         "| Config | Semillas | mIoU | mAcc | mF1 | OA | No evaluables |", "|---|---|---|---|---|---|---|"]
+         "| Config | Semillas | mIoU | mAcc | mF1 | OA | No evaluables | Pasos (total / al mejor) | Buffer (m) | Fuga reducida: solape train→test (%) |",
+        "|---|---|---|---|---|---|---|---|---|---|"]
     for r in result["summary"]:
+        st = "—" if r.get("steps_total") is None else f"{r['steps_total']:.0f} / {r['steps_at_best']:.0f}"
         L.append(f"| {r['config']} | {r['n_seeds']} | " + " | ".join(_fmt(r[k], r[f'{k}_sd'], r[f'{k}_ci']) for k in KEYS)
-                 + f" | {', '.join(r['not_evaluable']) or '—'} |")
+                 + f" | {', '.join(r['not_evaluable']) or '—'} | {st} | {_fmt(r.get('buffer_m'), pct=False)} | "
+                 + f"{_fmt(r.get('overlap_train_test_pct'), pct=False)} |")
     L += ["", "| De → a | ΔmIoU (pp) | IC 95 % | P(Δ ≤ 0) | Nota |", "|---|---|---|---|---|"]
     for d in result["deltas"]:
         L.append(f"| {d['from']} → {d['to']} | {100 * d['delta_mIoU']:+.1f} | "
@@ -180,10 +207,13 @@ def _save(result: dict, out: Path) -> None:
     (out / "comparison.md").write_text(to_markdown(result), encoding="utf-8")
     with open(out / "summary.csv", "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["config", "n_seeds"] + [f"{k}{s}" for k in KEYS for s in ("", "_sd", "_ci_lo", "_ci_hi")] + ["not_evaluable"])
+        extra = ["steps_total", "steps_at_best", "epochs_trained", "gpu_hours", "buffer_m",
+                 "overlap_train_test_pct", "min_dist_train_test_m"]
+        w.writerow(["config", "n_seeds"] + [f"{k}{s}" for k in KEYS for s in ("", "_sd", "_ci_lo", "_ci_hi")]
+                   + ["not_evaluable"] + extra)
         for r in result["summary"]:
             w.writerow([r["config"], r["n_seeds"]] + [v for k in KEYS for v in (r[k], r[f"{k}_sd"], *r[f"{k}_ci"])]
-                       + [";".join(r["not_evaluable"])])
+                       + [";".join(r["not_evaluable"])] + [r.get(k) for k in extra])
     with open(out / "per_class.csv", "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["config", "class", "evaluable", "n_photos", "iou", "iou_sd", "iou_ci_lo", "iou_ci_hi"])

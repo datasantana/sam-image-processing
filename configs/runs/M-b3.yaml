@@ -1,16 +1,23 @@
 # M-b3 — reproducción APROXIMADA de la receta de Mauricio (run05_b3_v2), entrenada en nuestro dataset
-# y protocolo. No es parte de la escalera J0-J3. Ver docs/mauricio_config.md para el detalle.
+# y protocolo. No es parte de la escalera J0-J3 (se compara con J3: `reference`). Detalle en
+# docs/mauricio_config.md.
 #
 # Tomado de la hoja Config:   modelo nvidia/mit-b3, crop 1024, esc_entr [0.5, 1.0], esc_inf 0.75,
 #                             lote 8, lr 6e-5, epocas_max 100, muestras_epoca 880, paciencia 15,
-#                             pesos_clase None.  (semilla 42 = primera de nuestras 3 semillas)
-# Tomado de la hoja LEEME:    selección del checkpoint por "max-min" (máximo del IoU mínimo por clase en val).
+#                             pesos_clase None.  (semilla 42 = nuestra semilla por defecto)
+# Tomado de la hoja LEEME:    checkpoint "mejor_maxmin".
+# Implementado así (interpretación = SUPUESTO):
+#   - esc_entr: factor s ~ Uniforme continua [0.5, 1.0] por muestra; se recorta una ventana de 1024/s px
+#     nativos y se reescala a 1024 (≡ reescalar la foto por s y recortar 1024).
+#   - mejor_maxmin: se guarda el checkpoint que maximiza el IoU mínimo por clase en val, sobre las
+#     clases presentes en al menos 1 foto de val (background/sin_clase excluido).
 # SUPUESTO (no está en la hoja): AdamW con weight decay 0.01, decaimiento poly (potencia 1.0) por
-#   iteración sin warmup, pérdida CE sin pesos, aumento = reescalado [0.5,1.0] + recorte + flip
-#   horizontal, inferencia = foto reescalada a 0.75 + ventana deslizante 1024 con 50 % de solape,
+#   iteración sin warmup, pérdida CE sin pesos, aumento = reescalado + recorte + flip horizontal,
+#   inferencia = foto reescalada a 0.75 + ventana deslizante 1024 con 50 % de solape,
 #   normalización ImageNet.
 # Corrección común a todos los pasos: background (sin anotar) se ignora; Mauricio entrenaba su
 #   'sin_clase' como clase y la excluía solo del criterio.
+reference: J3.yaml
 description: "Receta de Mauricio (aprox.): SegFormer mit-b3, AdamW 6e-5 poly, CE, escala [0.5,1], 100 ép., paciencia 15, max-min"
 model: {arch: segformer, hf_name: nvidia/mit-b3, weights: imagenet}
 data:

@@ -100,7 +100,10 @@ def test_resume_gives_same_metrics(store, tmp_path, name):
     assert a["test"]["mIoU"] == pytest.approx(b["test"]["mIoU"], abs=1e-9)
     la = (tmp_path / "a" / "x" / "y" / "epoch_log.csv").read_text().splitlines()
     lb = (rb / "epoch_log.csv").read_text().splitlines()
-    strip = lambda rows: [",".join(c for i, c in enumerate(r.split(",")) if i != 7) for r in rows]  # sin 'seconds'
+    def strip(lines):  # sin columnas de tiempo
+        head = lines[0].split(",")
+        keep = [i for i, h in enumerate(head) if h not in ("seconds", "train_seconds", "val_seconds")]
+        return [[r.split(",")[i] for i in keep] for r in lines]
     assert strip(la) == strip(lb)
     wa = torch.load(tmp_path / "a" / "x" / "y" / "best.pt", weights_only=False)["model"]
     wb = torch.load(rb / "best.pt", weights_only=False)["model"]
@@ -119,3 +122,21 @@ def test_changed_config_in_same_run_dir_is_rejected(store, tmp_path):
     cfg2 = tiny_cfg("J0", optim={"lr": 1e-3})
     with pytest.raises(RuntimeError, match="no coincide"):
         train_run(cfg2, store, split, tmp_path / "r" / "a" / "b", seed=1, log=lambda *a: None)
+
+
+def test_step_budget_is_logged_and_j0_pasos_matches_j1(store, tmp_path):
+    split = split_of(store)
+    over = {"data": {"samples_per_epoch": 16}, "train": {"epochs": 2}}
+    j0 = train_run(tiny_cfg("J0", data={"samples_per_epoch": None}, train={"epochs": 2}), store, split,
+                   tmp_path / "a" / "b" / "j0", 3, log=lambda *a: None)
+    jp = train_run(tiny_cfg("J0-pasos", **over), store, split, tmp_path / "a" / "b" / "jp", 3, log=lambda *a: None)
+    j1 = train_run(tiny_cfg("J1", **over), store, split, tmp_path / "a" / "b" / "j1", 3, log=lambda *a: None)
+    # batch 4 = 2 micro-lotes de 2. J0: 6 fotos → 3 micro-lotes → 2 pasos/época.
+    assert j0["optimizer_steps_total"] == 2 * 2
+    # J0-pasos y J1: 16 muestras/época → 8 micro-lotes → 4 pasos/época: mismo presupuesto
+    assert jp["optimizer_steps_total"] == j1["optimizer_steps_total"] == 2 * 4
+    log = (tmp_path / "a" / "b" / "jp" / "epoch_log.csv").read_text().splitlines()
+    head = log[0].split(",")
+    for col in ("opt_steps", "train_seconds", "val_seconds", "n_train_samples", "n_val"):
+        assert col in head
+    assert log[-1].split(",")[head.index("n_train_samples")] == "16"

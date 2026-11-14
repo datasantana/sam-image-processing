@@ -168,17 +168,20 @@ class _EpochDataset:
 
 
 class ResizeDataset(_EpochDataset):
-    """J0: cada foto completa, reescalada a ``size``×``size`` + aumentos. Una época = una pasada."""
+    """J0: cada foto completa, reescalada a ``size``×``size`` + aumentos."""
 
     def __init__(self, store: PhotoStore, names: list[str], data_cfg: dict, seed: int):
         self.store, self.names, self.cfg, self.seed = store, list(names), data_cfg, seed
         self.aug = build_augment(data_cfg["augment"], resize=data_cfg["resize"])
+        # J0: una pasada por las fotos. J0-pasos: samples_per_epoch muestras por época (fotos repetidas
+        # en ciclo y barajadas por el DataLoader, cada una con su propio aumento).
+        self.n = int(data_cfg.get("samples_per_epoch") or len(self.names))
 
     def __len__(self):
-        return len(self.names)
+        return self.n
 
     def __getitem__(self, i):
-        p = self.store[self.names[i]]
+        p = self.store[self.names[i % len(self.names)]]
         seed_compose(self.aug, _sample_seed(self.seed, self.epoch, i))
         out = self.aug(image=p.image, mask=p.mask)
         return to_tensor(out["image"], out["mask"], self.cfg["mean"], self.cfg["std"])
