@@ -172,3 +172,47 @@ def test_scale_range_crops_cover_larger_native_area(store):
         assert x.shape == (3, 32, 32)
     s = np.array(sides) / 32  # side nativo = crop / escala → escala = 32 / side
     assert (s >= 1.0 - 1e-9).all() and (s <= 2.0 + 1e-9).all() and s.std() > 0.1
+
+
+class _DeviceTensor:
+    """Imita un estado RNG movido a la GPU (torch.cuda.ByteTensor): no es un ByteTensor de CPU,
+    pero .cpu() devuelve el estado original. torch.set_rng_state lo rechaza con el mismo TypeError
+    que se vio en Colab ("RNG state must be a torch.ByteTensor")."""
+
+    def __init__(self, t):
+        self._t = t
+
+    def cpu(self):
+        return self._t
+
+
+def test_set_rng_state_accepts_state_mapped_to_another_device():
+    from segpipe.train import rng_state, set_rng_state
+    s = rng_state()
+    expected = torch.rand(5)
+    with pytest.raises(TypeError, match="ByteTensor"):  # el fallo original, sin GPU
+        torch.set_rng_state(_DeviceTensor(s["torch"]))
+    set_rng_state({**s, "torch": _DeviceTensor(s["torch"])})
+    assert torch.equal(torch.rand(5), expected)
+
+
+def test_resume_loads_checkpoints_on_cpu_and_survives_gpu_mapped_rng(store, tmp_path, monkeypatch):
+    cfg = tiny_cfg("J0", train={"epochs": 2})
+    split = split_of(store)
+    rd = tmp_path / "r" / "a" / "b"
+    with pytest.raises(Interrupted):
+        train_run(cfg, store, split, rd, seed=5, log=lambda *a: None, stop_after_epochs=1)
+    real_load, seen = torch.load, []
+
+    def fake_load(f, *a, **kw):
+        seen.append((str(f).rsplit("\\", 1)[-1].rsplit("/", 1)[-1], kw.get("map_location")))
+        ck = real_load(f, *a, **kw)
+        if "rng" in ck:  # checkpoint como lo dejaría una carga en GPU
+            ck["rng"] = {**ck["rng"], "torch": _DeviceTensor(ck["rng"]["torch"])}
+        return ck
+
+    monkeypatch.setattr(torch, "load", fake_load)
+    r = train_run(cfg, store, split, rd, seed=5, log=lambda *a: None)
+    assert r["epochs_trained"] == 2
+    assert [n for n, _ in seen] == ["last.pt", "best.pt"]
+    assert all(isinstance(m, str) and m == "cpu" for _, m in seen)

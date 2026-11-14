@@ -73,12 +73,21 @@ def rng_state() -> dict:
     return s
 
 
+def _cpu_byte_state(t) -> torch.Tensor:
+    """torch.set_rng_state / torch.cuda.set_rng_state exigen un ByteTensor en CPU.
+
+    Un checkpoint cargado con map_location="cuda" deja estos estados en la GPU (falló al reanudar
+    en Colab), así que se devuelven a CPU sin cambiar su contenido.
+    """
+    return t.cpu() if hasattr(t, "cpu") else t
+
+
 def set_rng_state(s: dict) -> None:
-    random.setstate(s["python"])
+    random.setstate(s["python"])           # objetos de Python: no dependen del dispositivo
     np.random.set_state(s["numpy"])
-    torch.set_rng_state(s["torch"])
+    torch.set_rng_state(_cpu_byte_state(s["torch"]))
     if "cuda" in s and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(s["cuda"])
+        torch.cuda.set_rng_state_all([_cpu_byte_state(t) for t in s["cuda"]])
 
 
 def seed_everything(seed: int) -> None:
@@ -208,7 +217,10 @@ def train_run(cfg: dict, store: PhotoStore, split: dict, run_dir: str | Path, se
     start_epoch, best, bad, history = 0, -float("inf"), 0, []
     last = run_dir / "last.pt"
     if last.exists():
-        ck = torch.load(last, map_location=device, weights_only=False)
+        # Siempre en CPU: los estados RNG deben quedar como ByteTensor de CPU; load_state_dict copia
+        # los pesos al dispositivo del modelo y Optimizer.load_state_dict mueve su estado al
+        # dispositivo de cada parámetro.
+        ck = torch.load(last, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["optimizer"])
         if sched is not None and ck.get("scheduler") is not None:
@@ -290,7 +302,7 @@ def train_run(cfg: dict, store: PhotoStore, split: dict, run_dir: str | Path, se
     # --- evaluación final con el mejor checkpoint
     if not (run_dir / "best.pt").exists():
         raise RuntimeError(f"{run_dir}: no hay best.pt (¿métrica de selección siempre NaN?)")
-    bk = torch.load(run_dir / "best.pt", map_location=device, weights_only=False)
+    bk = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)  # pesos → modelo vía load_state_dict
     model.load_state_dict(bk["model"])
     ev = cfg["eval"]
     result = {"run_dir": str(run_dir), "seed": seed, "best_epoch": bk["epoch"] + 1, "select": select,
