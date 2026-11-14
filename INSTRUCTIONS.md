@@ -2,6 +2,8 @@
 
 This document captures the architectural decisions, known limitations, and concrete directions for improving the `sam-image-processing` project. It is written for contributors (human or AI) who will iterate on the codebase.
 
+> **Major restructuring (2026-11-14, branch `feat/segpipe-ablation`).** Training logic moved out of the notebook into the tested `segpipe/` package; Azure Blob Storage (no longer exists) was replaced by a verified Google Drive archive; the random 80/20 split was replaced by a spatial block split; `background` is now ignored instead of trained. Sections 12–14 below are **historical plans written for the legacy notebook** and are kept for context; each one has a banner with its current status.
+
 ---
 
 ## 1. Current State Summary
@@ -10,242 +12,132 @@ This document captures the architectural decisions, known limitations, and concr
 
 | Artifact | Purpose | Maturity |
 |----------|---------|----------|
-| `automatic_mask_generator_example.ipynb` | Zero-shot mask generation with SAM 2 → COCO JSON export for CVAT | Working prototype; adapted from Meta's reference notebook |
-| `semantic_segmentation_training.ipynb` | End-to-end training of DeepLabv3+/PSPNet on CVAT-annotated drone imagery stored in Azure Blob Storage | Functional pipeline; no automated tests, no CLI, no experiment tracking beyond TensorBoard |
+| `segpipe/` | Class-schema-configurable segmentation pipeline: dataset fetch/verify/validate, spatial block split, training with per-epoch checkpoint + resume, native-resolution metrics with photo-bootstrap CIs, comparison report | Tested on CPU with `pytest` (synthetic data + real pack for data/split); **not yet run on GPU** |
+| `configs/datasets/pascual.yaml` | Dataset config (Drive file ID, sha256, sizes, paths, ignored classes, geometry columns) | Verified against the real `segpack_v1.zip` |
+| `configs/runs/*.yaml` | Ablation steps J0–J3, M-b3 (+ optional J2-loss, PSPNet, UNetPP) with `base:` inheritance | — |
+| `notebooks/train_ablation.ipynb` | Thin Colab orchestration: setup, study, smoke run, queue, comparison table | Syntax-checked; not executed on Colab yet |
+| `notebooks/automatic_mask_generator_example.ipynb` | SAM 2 zero-shot masks → COCO JSON for CVAT; images now come from the segpack (`ensure_dataset`) | I/O cells rewritten (Azure removed); not re-executed |
+| `notebooks/legacy/semantic_segmentation_training.ipynb` | Original training notebook, **unchanged** (historical record; its Azure cells no longer work) | Frozen |
+| `tools/pack_dataset.py` | Builds the segpack from a CVAT "Segmentation mask 1.1" export | Used to build `segpack_v1.zip` |
+| `tests/` | pytest suite (CPU) | See README "Pruebas locales" |
 
 ### What does NOT exist yet
-- No Python package / module structure — everything lives inside notebooks.
-- No inference script or deployment pipeline.
-- No CI/CD, linting, or automated testing.
-- ~~No `requirements.txt` or `pyproject.toml`.~~ → `requirements.txt` added (2026-03-03).
-- No Dockerfile or reproducible environment beyond "run on Colab".
-- No model registry or versioned artifact storage.
-- ~~No per-class IoU evaluation or confusion matrix.~~ → Per-class mIoU in training loop + `SegmentationMetrics` class for post-training evaluation (2026-03-03).
+- No GPU run of the new pipeline (timings, memory, AMP behaviour unverified).
+- No re-mapping of predictions of a fine-schema model into a coarse common schema at evaluation time (the fine→coarse mapping is applied to labels before training).
+- No CI; tests are run manually (`pytest`).
+- No inference/export script for new, unlabeled photos.
+- Old checkpoints (`2025/training/*.pth`) were trained with 14 classes due to the labelmap-header bug and are **incompatible**; do not load them.
 
 ---
 
 ## 2. Architecture Decisions & Rationale
 
-### 2.1 Why notebooks instead of scripts?
-The primary user is running on **Google Colab** with a GPU. Notebooks provide immediate visual feedback (plots, printed tables) and require zero local setup. The trade-off is that notebooks are hard to version-control, test, and reuse.
+### 2.1 Package + thin notebook
+Colab is the only GPU runtime (no local GPU). Logic lives in `segpipe/` so it can be unit-tested on CPU; the notebook only clones the repo, sets parameters and calls `prepare_study` / `run_queue` / `report.build`.
 
-**Future direction:** Extract reusable logic into a `src/` Python package and keep notebooks as thin orchestration layers that import from it.
+### 2.2 ~~Why Azure Blob Storage?~~ → Verified Drive archive
+> **Replaced** (2026-11-14). Azure Blob Storage no longer exists and images cannot be re-downloaded from CVAT. The dataset is a single archive (`segpack_v1.zip`) in Google Drive. `segpipe.data_io.ensure_dataset` fetches it (validated local copy → Drive API with the user's account → mounted Drive → `SEGPACK_DIR`/`SEGPACK_ZIP`), checks size + sha256, extracts to the VM's local disk and validates against `manifest.csv`. A Colab kernel cannot see the user's local disk/OneDrive, so nothing depends on them. No secrets or connection strings are stored anywhere.
 
-### 2.2 Why Azure Blob Storage?
-The team already stores drone imagery and CVAT exports in Azure. The notebook downloads data at runtime instead of committing large files to Git. This keeps the repo lightweight.
+### 2.3 Loss
+J0 keeps the legacy loss (Dice + inverse-frequency weighted CE). Other losses (`ce`, `focal`, `dice_focal`, `sqrt_inverse_freq` weights) are config options. All losses use `ignore_index=255` for unannotated pixels.
 
-**Future direction:** Abstract the storage backend behind a simple interface so it can be swapped for S3, GCS, or a local path.
+### 2.4 ~~Configurable random split~~ → Spatial block split
+> **Replaced** (2026-11-14). `train_test_split(0.8, seed 42)` leaked information: neighbouring oblique photos see the same ground. `segpipe.split` uses the approximate ground-footprint centre (GPS + `RelativeAltitude / tan(|GimbalPitch|)` along `GimbalYawDegree`), 150 m grid blocks, k = 5 block folds (test = f, val = f+1) and a 50 m buffer excluding train photos near val/test. Rationale and numbers: README "Protocolo de evaluación".
 
-### 2.3 Why DiceLoss instead of CrossEntropy?
-DiceLoss directly optimizes the overlap metric and handles class imbalance better than pixel-wise cross-entropy for segmentation tasks where background dominates. The current implementation uses `smp.losses.DiceLoss(mode='multiclass')`.
+### 2.5 Class schema from `classes.json`
+`classes.json` (ordered `index, name, rgb`) is the single source of truth; `labelmap.txt` is no longer parsed. RGB→index is vectorized and **fails on unknown colours**. `background` (black, no CVAT polygon) is ignored in loss, metrics and confusion matrix in every step, including J0 — a correction vs. the legacy notebook, which trained it as a class.
 
-**Current limitation:** DiceLoss alone provides smooth overlap gradients but lacks pixel-level precision. After switching from binary IoU to per-class mIoU (§3.2), this became visible — the model achieves ~0.36 mIoU, well below the Wilk et al. (2022) baseline of 0.60. A combined loss is needed.
+### 2.6 Metrics
+Per-photo confusion matrices at native resolution (4032×2268); mIoU/OA/mAcc/mF1 + per class; classes present in < K photos (default 5) of the evaluated partition are "not evaluable" and excluded from the means (listed explicitly); 95 % CIs by bootstrapping photos. With block CV the test predictions of all folds are pooled (each photo tested once).
 
-**Planned change (§14.1):** Replace `DiceLoss` with `DiceLoss + CrossEntropyLoss` combined loss. CrossEntropy provides per-pixel gradients that help the model discriminate between similar classes; DiceLoss handles class imbalance. This is the standard approach in the segmentation literature.
-
-### 2.4 ~~Why a fixed train/val split (first 53)?~~ → Configurable split
-
-> **✅ RESOLVED** (2026-03-03). Now uses `TRAIN_RATIO` (default 0.8) and `RANDOM_SEED` (42) with `sklearn.model_selection.train_test_split`.
-
-### 2.5 ~~Why pixel-level RGB→index conversion at runtime?~~ → Vectorized LUT
-
-> **✅ RESOLVED** (2026-03-03). Replaced per-pixel Python loop with a pre-built 256³ NumPy lookup table. See §3.1.
+### 2.7 Reproducibility and resumption
+Per-sample randomness derives from (seed, epoch, index); `last.pt` stores model/optimizer/scheduler/scaler/epoch/best/patience/history/RNG and is written atomically every epoch; re-running the same cell resumes. A test asserts that an interrupted + resumed run produces the same log, weights and metrics as an uninterrupted one. Each run records config, split, library versions and git commit.
 
 ---
 
 ## 3. Known Limitations & Technical Debt
 
-### 3.1 Performance bottleneck: RGB mask conversion
+Items 3.1–3.8 describe the legacy notebook; their status in `segpipe` is noted.
 
-> **✅ RESOLVED** (2026-03-03)
-> Replaced per-pixel Python loop with a pre-built 256³ NumPy lookup table (`_build_lookup_table()`) that converts the entire mask in a single vectorized indexing operation. The slow-path fallback now also uses vectorized broadcasting instead of nested loops. Expected ~10-50× speedup on 512×512 masks.
+- **3.1 RGB mask conversion speed** — ✅ vectorized (`ClassSchema.rgb_to_index`).
+- **3.2 Binary IoU** — ✅ per-class from confusion matrices (`segpipe.metrics`).
+- **3.3 Early stopping** — ✅ `train.patience`.
+- **3.4 Fragile labelmap parsing** — ✅ RESOLVED (2026-11-14): `classes.json` is used instead; the legacy header bug produced 14 classes.
+- **3.5 No data validation** — ✅ RESOLVED (2026-11-14): archive sha256/size, pair completeness, image/mask sizes vs. manifest, unknown mask colours.
+- **3.6 LR plot** — ✅ `lr` logged per epoch in `epoch_log.csv`.
+- **3.7 Standard metrics** — ✅ mIoU/OA/mAcc/mF1 + bootstrap CIs.
+- **3.8 Recipe under-optimized** — now studied as the J0–J3 ablation. Legacy Run 1–5 numbers below were measured with the leaky random split, 14 classes and `background` as a class; **they are not comparable** with new results.
 
-### 3.2 IoU calculation is binary, not per-class
+New limitations:
+- **3.9 Residual spatial overlap.** The 50 m buffer removes near-duplicate photos but not all footprint overlap (~120 m deep footprint). Report `min_dist_train_heldout_m` per fold.
+- **3.10 Small dataset.** 66 photos → train 31–39 per fold; seed variance can be large. Report mean ± SD over seeds and photo-bootstrap CIs.
+- **3.11 M-b3 is approximate.** Several hyperparameters are inferred; see `docs/mauricio_config.md`.
+- **3.12 J1 changes the epoch definition.** J0 epochs are one pass over ~35 resized photos; J1+ epochs are 880 native crops (as in Mauricio's recipe), so J1+ get more optimizer steps. This is part of the J1 change and should be stated in the paper.
 
-> **✅ RESOLVED** (2026-03-03)
-> Replaced `calculate_iou()` with `calculate_miou()` that computes IoU independently for each class and returns the mean. Training loop now reports per-class mean IoU (mIoU) instead of binary IoU.
+<details><summary>Legacy run log (historical, not comparable)</summary>
 
-### 3.3 No early stopping
+| Run | Model | Loss | Best val mIoU | Notes |
+|-----|-------|------|---------------|-------|
+| 1 | PSPNet R50 | Dice | 0.3354 | 50/50 epochs |
+| 2 | PSPNet R50 | Dice | 0.3609 | early stopped at 67 |
+| 3 | DeepLabv3+ R50 | Dice | 0.3738 | OA 70.9 % |
+| 4 | DeepLabv3+ R50 | Dice + CE (unweighted), strong aug | 0.3800 | Fence/Lightning Posts collapsed to 0 |
+| 5 | DeepLabv3+ R50 | Dice + weighted CE, CoarseDropout 16 px | — | = J0 recipe |
 
-> **✅ RESOLVED** (2026-03-03)
-> Added `EARLY_STOPPING_PATIENCE` (default: 10 epochs). Training loop now tracks `epochs_without_improvement` and breaks early when patience is exhausted. Configurable via the `EARLY_STOPPING_PATIENCE` variable in the training cell.
-
-### 3.4 Labelmap parsing is fragile
-The parser assumes `ClassName:R,G,B` format but does not handle headers, comments, or alternate delimiters. If the file starts with a header line (e.g., CVAT's default `label_name:r:g:b:a::` format), parsing silently produces wrong mappings.
-
-**Fix:** Add robust parsing that detects the format and handles edge cases (header rows, alpha channels, different delimiters).
-
-### 3.5 No data validation
-There is no check that image dimensions match mask dimensions, that mask pixel values are within the expected class range, or that all classes in the labelmap appear in the masks.
-
-**Fix:** Add a pre-training validation pass that scans the full dataset and reports anomalies.
-
-### 3.6 Learning rate plot is incorrect
-
-> **✅ RESOLVED** (2026-03-03)
-> The training loop now appends `current_lr` to a `learning_rates` list at the start of each epoch. Cell 26 plots this list directly, showing the actual ReduceLROnPlateau schedule.
-
-### 3.7 No standardized evaluation metrics (Wilk et al. 2022 comparison)
-The current pipeline only tracks a single binary IoU during training. It does **not** compute the four standard metrics used in the semantic segmentation literature — specifically the ones reported by Wilk et al. (2022) for UAV roof-type classification:
-
-| Metric | Wilk et al. (image) | Wilk et al. (texture voting) |
-|--------|---------------------|------------------------------|
-| mIoU   | 60.3%               | 63.8%                        |
-| OA     | 84.1%               | 89.9%                        |
-| mAcc   | 81.4%               | 89.8%                        |
-| mF1    | 72.0%               | 73.5%                        |
-
-Without these, results cannot be compared to the literature.
-
-**Fix priority: HIGH**
-
-Implement a reusable `SegmentationMetrics` class + comparison utilities (see §12 for full specification). The fix involves:
-1. Replacing `calculate_iou()` with a confusion-matrix-based metric computer that yields mIoU, OA, mAcc, mF1 per epoch.
-2. Adding a post-training evaluation section that runs the trained model on the full val set, computes per-class metrics, and exports results to CSV.
-3. Adding a benchmark comparison chart that overlays our results against Wilk et al. (2022).
-
-> **Partially resolved** (2026-03-03): `SegmentationMetrics` class, `evaluate_model()`, CSV export, confusion matrix, and Wilk comparison chart are all implemented in cells 29–35. Training loop uses `calculate_miou()` for per-class mIoU. Post-training evaluation cell uses `torch.load(..., weights_only=False)` for PyTorch 2.6+ compatibility (2026-03-04).
-
-### 3.8 Training recipe under-optimized for per-class mIoU
-
-**Discovered:** 2026-03-04, after switching from binary IoU to per-class mIoU (§3.2).
-
-**Context:** The old binary `calculate_iou()` reported ~0.64 IoU by treating all non-background pixels as one class. After replacing it with per-class `calculate_miou()`, the reported metric dropped to ~0.36 mIoU — not because the model got worse, but because the measurement is now honest. The model actually struggles to distinguish between the 14 roof-type classes.
-
-**Baseline results (2026-03-04, PSPNet + resnet50, DiceLoss only):**
-
-| Run | Epochs | Best mIoU | Notes |
-|-----|--------|-----------|-------|
-| 1 (50 epochs, patience 10) | 50/50 | 0.3354 | No early stop |
-| 2 (100 epochs, patience 15) | 67/100 | 0.3609 | Early stopped at 67, best at 52 |
-
-**Intermediate results (2026-04-30, DeepLabv3+ + resnet50, DiceLoss only):**
-
-Change C (architecture → DeepLabv3+) was applied in isolation before A and B. Results show only marginal improvement because DiceLoss and weak augmentation remain the dominant bottlenecks.
-
-| Run | Epochs | Best val mIoU | OA | mAcc | mF1 | Notes |
-|-----|--------|---------------|----|------|-----|-------|
-| 3 (50 epochs, patience 10) | 40/50 | 0.3738 | 70.9% | 44.7% | 46.5% | Early stopped; DiceLoss only |
-
-**Results (2026-04-30, DeepLabv3+ + resnet50, Dice+CE unweighted + strong aug):**
-
-| Run | Epochs | Best val mIoU | OA | mAcc | mF1 | Notes |
-|-----|--------|---------------|----|------|-----|-------|
-| 4 (50 epochs, patience 10) | ~40/50 | 0.3800 | 74.6% | 46.6% | 48.4% | Early stopped; unweighted CE |
-
-Key observations from Run 4: Unweighted `CrossEntropyLoss` was dominated by high-pixel classes (Road, Buildings, Vegetation). Minority classes regressed severely: Fence 83%→0%, Lightning Posts 78%→0%, Vehicle 41%→23%. The net mIoU gain was only +0.6% despite the combined loss. Root cause: CE without class weights makes rare classes invisible to the gradient.
-
-Additionally, `CoarseDropout(max_height=32, max_width=32)` erased small objects entirely (Lightning Posts, Vehicles are ~20px wide at 512px).
-
-**Run 5 fix (2026-04-30):**
-1. Replaced `nn.CrossEntropyLoss()` with `nn.CrossEntropyLoss(weight=class_weights)` where `class_weights` are computed by `compute_class_weights()` — inverse pixel frequency, normalized so mean weight = 1.0.
-2. Reduced `CoarseDropout` to `max_height=16, max_width=16, p=0.1`.
-
-> **✅ PARTIALLY RESOLVED** (2026-04-30, Run 5 changes applied). Expected target after Run 5: **0.44–0.48 mIoU**. Update this entry with actual results after the next training run.
+</details>
 
 ---
 
 ## 4. Recommended Future Improvements
 
-### 4.1 Short-Term (next iteration) — Training Recipe Optimization
-
-> **✅ COMPLETED** (2026-04-30). All three §14 changes applied. Next target: reach ≥0.50 mIoU via §13.1 refinements (ASPP dilation tuning, boundary loss, resnet101 backbone).
-
-~~**Goal:** Raise mIoU from ~0.36 to ~0.42–0.50 by improving the loss function, augmentation, and default architecture. See §14 for the full implementation spec.~~
-
-| # | Change | Cell(s) Affected | Impact | Status |
-|---|--------|-------------------|--------|--------|
-| A | **Combined loss: DiceLoss + CrossEntropyLoss** (§14.1) | Cell 20 (Model Init) | +3–8% mIoU | ✅ Applied 2026-04-30 |
-| B | **Stronger data augmentation** (§14.2) | Cell 18 (Transforms) | +2–5% mIoU | ✅ Applied 2026-04-30 |
-| C | **Default architecture → DeepLabv3+** (§14.3) | Cell 13 (Model Config) | +1–4% mIoU | ✅ Applied 2026-04-30 (Run 3) |
-
-### 4.4 Completed
-
-| # | Improvement | Status | Date |
-|---|-------------|--------|------|
-| 1 | **Vectorize RGB mask conversion** (§3.1) | ✅ Done — 256³ LUT in `_build_lookup_table()` | 2026-03-03 |
-| 2 | **Per-class IoU metrics** (§3.2) | ✅ Done — `calculate_miou()` replaces binary IoU | 2026-03-03 |
-| 3 | **Early stopping** (§3.3) | ✅ Done — `EARLY_STOPPING_PATIENCE` configurable | 2026-03-03 |
-| 4 | **Fix LR plot** (§3.6) | ✅ Done — `learning_rates` list tracked per epoch | 2026-03-03 |
-| 5 | **Add `requirements.txt`** | ✅ Done — root-level `requirements.txt` | 2026-03-03 |
-| 6 | **Configurable train/val split ratio** | ✅ Done — `TRAIN_RATIO` + `RANDOM_SEED` + `train_test_split` | 2026-03-03 |
-| 6b | **Wilk et al. (2022) benchmark metrics** (§3.7, §12) | ✅ Done — `SegmentationMetrics` class + CSV export + comparison charts | 2026-03-03 |
-| 7 | **§14.1 Combined loss: Dice + CE** | ✅ Done — `combined_loss()` in Cell 20; replaces `DiceLoss` only | 2026-04-30 |
-| 8 | **§14.2 Stronger data augmentation** | ✅ Done — `ShiftScaleRotate`, `HSV`, `GaussianBlur`, `CoarseDropout` in Cell 18 | 2026-04-30 |
-| 9 | **§14.3 Default architecture → DeepLabv3+** | ✅ Done — `MODEL_ARCH = "DeepLabv3+"` in Cell 13 | 2026-04-30 |
-
-### 4.2 Medium-Term (next 3–5 iterations)
-
-| # | Improvement | Impact | Effort |
-|---|-------------|--------|--------|
-| 7 | **Extract code into `src/` package** | Testable, reusable code; thin notebooks | Medium |
-| 8 | **Add a CLI inference script** | Run predictions without a notebook | Medium |
-| 9 | ~~**Experiment with combined losses**~~ | → Promoted to §4.1-A (DiceLoss + CE) | — |
-| 10 | ~~**Add a confusion matrix visualization**~~ | → Already implemented in `plot_confusion_matrix()` (cell 33) | — |
-| 11 | **Mixed-precision training** (`torch.cuda.amp`) | ~2× speedup, lower GPU memory | Low |
-| 12 | **TensorBoard integration** (already installed, not wired) | Live training monitoring in Colab | Low |
-| 13 | **Abstract storage backend** | Support S3, GCS, local | Medium |
-| 14 | **Pre-convert masks to index format** | Eliminate runtime RGB conversion entirely | Medium |
-| 23 | **DeepLabV3+ ASPP dilation tuning + boundary loss** (§13.1) | Fine-grained edge recovery on small roof elements | Medium |
-| 24 | **PSPNet multi-scale inference + mosaic tiling** (§13.2) | Reduce tile-edge artifacts, capture global context | Medium |
-| 25 | **UNet++ deep supervision + CCE+Focal Tversky loss** (§13.3) | Improve minority-class recall via auxiliary losses + targeted sampling | Medium |
-
-### 4.3 Long-Term
-
-| # | Improvement | Impact | Effort |
-|---|-------------|--------|--------|
-| 15 | **Hydra / OmegaConf config system** | Declarative experiment configuration | Medium |
-| 16 | **Weights & Biases or MLflow tracking** | Full experiment lineage, hyperparameter sweeps | Medium |
-| 17 | **CI pipeline** (GitHub Actions) | Lint, test, notebook smoke tests on every push | Medium |
-| 18 | **Docker image for training** | Reproducible environment beyond Colab | Medium |
-| 19 | **ONNX / TorchScript export** | Deploy model to edge devices or web services | Medium |
-| 20 | **Active learning loop** | Use SAM 2 to pre-annotate → human review in CVAT → retrain | High |
-| 21 | **Multi-GPU / distributed training** | Scale to larger datasets | High |
-| 22 | **Test with additional architectures** (UNet++, SegFormer, Mask2Former) | Find best accuracy/speed trade-off for drone imagery | Medium |
+| # | Improvement | Notes |
+|---|-------------|-------|
+| 1 | Run the smoke run and the J0–J3/M-b3 queue on Colab (`docs/smoke_run.md`) | First GPU validation; adjust `train.micro_batch` if the heuristic over/under-fills memory |
+| 2 | Evaluate fine-schema models in a common coarse schema | Needed to compare with Mauricio's 10-class model directly |
+| 3 | Add Mauricio's dataset (`configs/datasets/mauricio.yaml`) | Needs its segpack (same format) and an agreed common schema |
+| 4 | Inference script for unlabeled photos (+ GeoTIFF/point-cloud projection) | — |
+| 5 | CI running `pytest` on push | — |
+| 6 | §13 refinements (ASPP dilations, boundary loss, multi-scale inference, UNet++ deep supervision) | Add as new configs with `base:` so they stay single-change ablations |
 
 ---
 
 ## 5. How to Add a New Model Architecture
 
-The current design uses `segmentation-models-pytorch` (SMP), which makes this straightforward:
+1. Register it in `segpipe/models.py::build_model` (and its input multiple in `input_multiple`).
+2. Create `configs/runs/<Name>.yaml` with `base: J2.yaml` and a `model:` block.
+3. Add a forward/backward test in `tests/test_train.py`.
 
-1. In cell 13 (Model Configuration), add a new `elif` branch:
-   ```python
-   elif MODEL_ARCH == "UnetPlusPlus":
-       model_class = smp.UnetPlusPlus
-   ```
-2. No other changes are needed — the rest of the pipeline (loss, optimizer, dataset) is architecture-agnostic.
-3. Available SMP architectures: `Unet`, `UnetPlusPlus`, `MAnet`, `Linknet`, `FPN`, `PSPNet`, `DeepLabV3`, `DeepLabV3Plus`, `PAN`.
+Registered today: `deeplabv3plus`, `pspnet`, `unetplusplus` (smp, any smp encoder) and `segformer` (transformers, `hf_name`).
 
 ---
 
 ## 6. How to Add a New Dataset
 
-1. Upload images and masks to Azure Blob Storage under a known prefix.
-2. Update `LOCAL_IMG_DIR`, `LOCAL_MASK_DIR`, and `LOCAL_LABELMAP_DIR` in cell 6.
-3. Ensure the `labelmap.txt` follows the `ClassName:R,G,B` format (one class per line, no header).
-4. If masks are grayscale (pixel value = class index), the pipeline auto-detects this and skips RGB conversion.
-5. The train/val split is controlled by `TRAIN_RATIO` (default 0.8) and `RANDOM_SEED` (default 42) in cell 8. Adjust as needed.
+See README "Añadir otro dataset". In short: build a segpack with `tools/pack_dataset.py`, upload it to Drive, copy `configs/datasets/pascual.yaml`, set `archive.*`, `local.extract_dir`, `classes.ignore` and (optionally) `classes.target` + `classes.mapping` for a fine→coarse common schema, and use a new `STUDY_DIR`. The manifest must contain the GPS/gimbal columns named in `geometry:` for the spatial split.
 
 ---
 
-## 7. Hyperparameter Tuning Guide
+## 7. Hyperparameter Reference (run YAML keys)
 
-| Parameter | Current Value | Suggested Range | Notes |
-|-----------|--------------|-----------------|-------|
-| `MODEL_ARCH` | `PSPNet` | `DeepLabv3+`, `PSPNet`, `UnetPlusPlus` | Start with DeepLabv3+ for best general segmentation quality |
-| `BACKBONE` | `resnet50` | `resnet34` (faster) to `resnet101` (more capacity) | `resnet50` is a good default; `resnet101` if you have enough data |
-| `BATCH_SIZE` | `8` | `4`–`16` | Limited by GPU memory; reduce if OOM |
-| `LEARNING_RATE` | `1e-4` | `1e-5` to `5e-4` | Lower if training is unstable; higher if convergence is too slow |
-| `NUM_EPOCHS` | `50` | `30`–`150` | Use early stopping to find the right number |
-| `EARLY_STOPPING_PATIENCE` | `10` | `5`–`20` | Epochs without val mIoU improvement before stopping |
-| `TRAIN_RATIO` | `0.8` | `0.7`–`0.9` | Fraction of data for training (rest is validation) |
-| `RANDOM_SEED` | `42` | Any integer | Fixed seed for reproducible train/val split |
-| `IMAGE_SIZE` | `512` | `256`–`1024` | Larger = better detail but more memory; 512 is a solid default |
+| Key | J0 default | Notes |
+|-----|-----------|-------|
+| `model.arch` / `encoder` / `hf_name` | `deeplabv3plus` / `resnet50` / — | `segformer` uses `hf_name` (`nvidia/mit-b3`) |
+| `data.mode` | `resize` | `crops` = native-resolution random crops |
+| `data.resize` / `crop` | 512 / 1024 | |
+| `data.samples_per_epoch` | — | crops per epoch (880 in J1+) |
+| `data.scale_range` | — | random rescale before cropping (M-b3: [0.5, 1.0]) |
+| `data.sampler`, `rare_p`, `rare_classes`, `rare_px_frac` | `uniform`, 0.5, `auto`, 0.01 | `rare` = crops centred on rare-class pixels |
+| `data.augment` | `legacy` | `hflip`, `none` |
+| `infer.mode`, `window`, `overlap`, `scale` | `resize`, 1024, 0.5, 1.0 | `sliding` for J1+ |
+| `loss.name`, `weights` | `dice_wce`, `inverse_freq` | `ce`, `focal`, `dice_focal`; `none`, `sqrt_inverse_freq` |
+| `optim.name`, `lr`, `weight_decay` | `adam`, 1e-4, 1e-4 | `adamw` |
+| `sched.name` | `plateau` (×0.5, patience 5, on val loss) | `poly` (per iteration), `none` |
+| `train.batch` / `micro_batch` | 8 / auto | effective batch kept with gradient accumulation |
+| `train.epochs`, `patience`, `select` | 50, 10, `miou` | `maxmin` = maximize min per-class val IoU |
+| `train.amp` | true | bf16 if supported, else fp16 + GradScaler |
+| `eval.min_photos`, `n_boot` | 5, 2000 | "not evaluable" threshold K; bootstrap replicates |
 
-| Loss function | DiceLoss | DiceLoss, CE+Dice, FocalTversky | Combined Dice+CE is the recommended next step (§14.1) |
-| `LOSS_TYPE` (planned) | `"dice"` | `"dice"`, `"dice+ce"` | §14.1 — switch to `"dice+ce"` for better class discrimination |
-| Augmentation strength | Moderate | Moderate, Strong | §14.2 — `"strong"` uses ShiftScaleRotate, HSV, CoarseDropout |
+Study-level parameters (`prepare_study`): `protocol` (`cv`/`fixed`), `k` = 5, `block_m` = 150, `buffer_m` = 50, `split_seed` = 0.
 
 ---
 
@@ -254,63 +146,52 @@ The current design uses `segmentation-models-pytorch` (SMP), which makes this st
 | Term | Definition |
 |------|-----------|
 | **Semantic segmentation** | Classifying every pixel in an image into a predefined category |
+| **Footprint centre** | Approximate ground point at the centre of an oblique photo: GPS shifted by h/tan(pitch) along the gimbal yaw |
+| **Block CV** | Cross-validation where whole spatial blocks go to the same fold, to limit spatial leakage |
+| **Buffer** | Minimum footprint-centre distance between a train photo and any val/test photo |
+| **Not evaluable** | Class present in fewer than K photos of the evaluated partition; excluded from mean metrics |
+| **Photo bootstrap** | Resampling photos (not pixels) with replacement to obtain confidence intervals |
+| **Sliding-window inference** | Predicting overlapping native-resolution tiles and averaging logits |
 | **SAM 2** | Meta's Segment Anything Model v2 — a foundation model for zero-shot segmentation |
-| **DeepLabv3+** | Encoder-decoder architecture using atrous convolutions and ASPP for multi-scale segmentation |
-| **PSPNet** | Pyramid Scene Parsing Network — uses a pyramid pooling module for global context |
-| **ResNet backbone** | Pre-trained convolutional network (ImageNet) used as the feature extractor/encoder |
-| **DiceLoss** | Overlap-based loss function: $1 - \frac{2\|P \cap G\|}{\|P\| + \|G\|}$ |
-| **IoU** | Intersection over Union — primary metric for segmentation quality |
-| **CVAT** | Computer Vision Annotation Tool — open-source labeling platform |
-| **PASCAL VOC masks** | Segmentation masks where each class is a distinct RGB color in a PNG image |
-| **Albumentations** | Fast image augmentation library with mask-aware transforms |
-| **SMP** | `segmentation-models-pytorch` — library providing pre-built segmentation architectures |
-| **Atrous/Dilated convolution** | Convolution with spacing between kernel elements to increase receptive field without losing resolution |
-| **ASPP** | Atrous Spatial Pyramid Pooling — parallel atrous convolutions at multiple rates for multi-scale features |
-| **ReduceLROnPlateau** | Scheduler that halves the learning rate when the monitored metric stops improving |
-| **Overfitting** | Model memorizes training data but fails to generalize to unseen data (train metric >> val metric) |
+| **DeepLabv3+** | Encoder-decoder with atrous convolutions and ASPP |
+| **SegFormer (mit-b3)** | Transformer encoder (Mix Transformer) with a lightweight MLP decoder |
+| **PSPNet / UNet++** | Pyramid pooling network / nested U-Net (registered options) |
+| **SMP** | `segmentation-models-pytorch` |
+| **AMP** | Automatic mixed precision (bf16/fp16) |
+| **ReduceLROnPlateau / poly** | LR schedules: halve on plateau / polynomial decay per iteration |
 
 ---
 
 ## 9. File-Level Reference
 
-### `notebooks/semantic_segmentation_training.ipynb`
-
-| Cell(s) | Section | Key Variables / Functions |
-|---------|---------|--------------------------|
-| 1–2 | Title & Colab badge | — |
-| 3 | Install deps | `pip install` commands |
-| 4 | Intro markdown | — |
-| 5–6 | Azure connection & download | `AZURE_CONN_STR`, `CONTAINER_NAME`, `download_blobs()` |
-| 7–8 | Dataset preparation | `TRAIN_RATIO`, `RANDOM_SEED`, `image_files`, `mask_files`, `train_pairs`, `val_pairs`, `train_dataset`, `val_dataset` |
-| 9–11 | DL env setup | PyTorch, SMP, albumentations install |
-| 12–13 | Model config | `MODEL_ARCH`, `BACKBONE`, `BATCH_SIZE`, `LEARNING_RATE`, `NUM_EPOCHS`, `IMAGE_SIZE` |
-| 14 | Beginner guide (Spanish) | Explains Loss, IoU, overfitting in plain language |
-| 15–16 | Label map & RGB detection | `class_names`, `NUM_CLASSES`, `rgb_to_class`, `class_to_idx` |
-| 17–18 | Dataset & transforms | `RGBSegmentationDataset` (vectorized LUT), `train_transforms`, `val_transforms`, `train_loader`, `val_loader` |
-| 19–20 | Model init | `model`, `criterion` (DiceLoss; planned: Dice+CE §14.1), `optimizer` (Adam), `scheduler` (ReduceLROnPlateau) |
-| 21–22 | Forward pass test | Validates shapes with `model.eval()` |
-| 23–24 | Training loop | `train_one_epoch()`, `validate_one_epoch()`, `calculate_miou()`, `EARLY_STOPPING_PATIENCE`, `learning_rates`, checkpoint saving |
-| 25–26 | Visualization | matplotlib 4-panel figure, saved to `logs/training_results.png` |
-
-### `notebooks/automatic_mask_generator_example.ipynb`
-
-| Section | Purpose |
-|---------|---------|
-| Environment setup | Installs SAM 2, PyTorch, pycocotools, Azure SDK |
-| Model loading | Loads SAM 2 checkpoint |
-| Mask generation | `SAM2AutomaticMaskGenerator` with grid-based prompts |
-| COCO export | Converts masks to COCO JSON for CVAT import |
-| Azure integration | Reads/writes imagery and annotations from Blob Storage |
+| File | Key contents |
+|------|-------------|
+| `segpipe/data_io.py` | `ensure_dataset`, `download_from_drive`, `download_ranges`, `verify_archive`, `safe_extract`, `validate_extracted` |
+| `segpipe/classes.py` | `ClassSchema.from_json`, `rgb_to_index`, `IGNORE_INDEX = 255` |
+| `segpipe/split.py` | `footprint_centers`, `assign_blocks`, `make_folds`, `save_folds`, `split_report` |
+| `segpipe/data.py` | `PhotoStore`, `build_augment` (legacy aug, albumentations 1.x/2.x), `ResizeDataset`, `CropDataset` |
+| `segpipe/models.py` | `build_model`, `SegFormer` wrapper |
+| `segpipe/losses.py` | `class_weights`, `build_loss` |
+| `segpipe/infer.py` | `predict_logits` (resize / sliding window, optional scale) |
+| `segpipe/metrics.py` | `confusion`, `per_class`, `summarize`, `bootstrap`, `evaluate`, `save_report` |
+| `segpipe/train.py` | `train_run` (checkpoint/resume, final evaluation), `evaluate_photos` |
+| `segpipe/runner.py` | `prepare_study`, `write_ignored_report`, `run_queue`, `describe_ladder` |
+| `segpipe/report.py` | `build`, `to_markdown` |
+| `segpipe/config.py` | `load_run_config` (`base:` inheritance), `diff` |
+| `segpipe/env.py` | `gpu_info`, `micro_batch`, `num_workers`, `versions`, `git_commit` |
+| `notebooks/train_ablation.ipynb` | Sections: 1 code/deps, 2 parameters, 3 dataset+split, 4 smoke run, 5 queue, 6 comparison, 7 curves |
+| `notebooks/automatic_mask_generator_example.ipynb` | SAM 2 setup, image source (`ensure_dataset`), mask generation, COCO batch export |
+| `docs/smoke_run.md`, `docs/mauricio_config.md` | Smoke-run procedure; M-b3 provenance |
 
 ---
 
 ## 10. Conventions for Contributors
 
-1. **Notebook cells should be idempotent** — re-running a cell should not produce side effects.
+1. **Notebook cells must be idempotent and resumable** — re-running a cell continues where it left off (finished runs are skipped).
 2. **Print emoji prefixes** — use the established convention: ✅ success, ❌ error, ⚠️ warning, 🔍 informational, 📊 metrics, 💾 save, 🎯 key outputs.
-3. **Keep notebooks thin** — when extracting to `src/`, notebooks should only contain imports, configuration, and visualization. All logic should live in importable modules.
-4. **Azure secrets** — never commit connection strings. Always use Colab Secrets (`userdata.get()`) or environment variables.
-5. **Model checkpoints** — always save architecture name, backbone, `NUM_CLASSES`, and `class_names` alongside weights so checkpoints are self-describing.
+3. **Keep notebooks thin** — notebooks only contain imports, configuration, and visualization. All logic lives in `segpipe/` and is covered by `pytest`.
+4. **No secrets, no scattered paths** — dataset IDs, hashes and paths live in `configs/datasets/*.yaml`; Drive access uses the user's own Colab authentication. Never read training images from Drive (extract to the VM's local disk).
+5. **Runs are self-describing** — each run directory stores the resolved config, split, class names, library versions and git commit next to the weights.
 
 ---
 
@@ -331,7 +212,7 @@ The current design uses `segmentation-models-pytorch` (SMP), which makes this st
 
 ### 11.2 Code Quality
 
-1. **Test before committing.** At minimum, run the affected notebook end-to-end on Colab (or locally with a small data subset) and verify no cells error out.
+1. **Test before committing.** Run `pytest` locally (CPU). For changes that affect GPU behaviour, run the smoke run on Colab (`docs/smoke_run.md`).
 2. **No hardcoded secrets or paths.** All credentials must come from environment variables or Colab Secrets. Local paths must be relative or configurable.
 3. **Type hints and docstrings.** Any new function must include a docstring (Google style) and type hints for parameters and return values.
 4. **Keep backward compatibility.** If changing a function signature, preserve the old interface with a deprecation warning for at least one release cycle.
@@ -346,7 +227,7 @@ After completing any fix, feature, or refactor, update **all** of the following 
 |-------------|----------------|
 | **Bug fix or behavior change** | Update the relevant cell's markdown header/comments in the notebook. If the fix resolves a known limitation listed in INSTRUCTIONS.md §3, mark it as resolved with the PR reference and date. |
 | **New feature or parameter** | Add it to the notebook's markdown documentation cells, the README.md (Concepts / Quick Start sections), and the INSTRUCTIONS.md hyperparameter table (§7) or architecture guide (§5). |
-| **New dependency** | Add to the `!pip install` cell in the notebook, the README.md Dependencies section, and `requirements.txt` (once it exists). |
+| **New dependency** | Add it to `requirements.txt` (minimum version only) and to the install-if-missing cell of `notebooks/train_ablation.ipynb`. Never pin torch to a CUDA build. |
 | **Removed or deprecated feature** | Note the removal in INSTRUCTIONS.md with the date and rationale. Update README.md to remove references. |
 | **Performance improvement** | Log before/after benchmarks in the PR description and update INSTRUCTIONS.md §3 (Known Limitations) to reflect the resolved bottleneck. |
 | **New notebook or script** | Add an entry to README.md (Notebooks Overview) and INSTRUCTIONS.md (File-Level Reference, §9). |
@@ -394,6 +275,8 @@ When fixing a limitation listed in §3 of this document:
 ---
 
 ## 12. Wilk et al. (2022) Benchmark Metrics — Full Specification
+
+> **Historical (legacy notebook).** Implemented in `segpipe/metrics.py` (confusion matrix → mIoU/OA/mAcc/mF1, per class, CSV/JSON) with photo-bootstrap CIs and "not evaluable" classes. Cell numbers below refer to `notebooks/legacy/`.
 
 > **Reference:** Wilk, Ł. et al. (2022). "Automatic classification of roof types from 3D building models using semantic segmentation." *ISPRS Archives*, XLIII-B2-2022, 485–492.
 
@@ -529,6 +412,8 @@ For the beginner-guide markdown cell (currently in Spanish), add a subsection ex
 ---
 
 ## 13. Architecture-Specific Refinements — Implementation Plans
+
+> **Historical (legacy notebook), not implemented.** To try any of these, add a config with `base: J2.yaml` (or the relevant step) so it remains a single-change ablation. Sliding-window inference (§13.2.2-like, without Gaussian weighting) and UNet++ registration exist in `segpipe`.
 
 This section specifies per-architecture improvements that go beyond the default SMP configuration. Each subsection includes **rationale, implementation plan, PyTorch code, and new hyperparameters** to add to §7. All refinements preserve the existing metrics pipeline (§5–§6, §12).
 
@@ -1397,6 +1282,8 @@ if USE_OVERSAMPLING and MODEL_ARCH == "UnetPlusPlus":
 ---
 
 ## 14. Training Recipe Optimization — Implementation Plan
+
+> **Historical (legacy notebook).** Changes A–C are part of the J0 recipe (`configs/runs/J0.yaml`). Expected results quoted here were measured with the leaky random split and are not comparable.
 
 > **Status:** Planned (2026-03-04).
 > **Goal:** Raise per-class mIoU from ~0.36 to ~0.42–0.50 on 14-class drone/roof segmentation.
