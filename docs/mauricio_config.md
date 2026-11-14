@@ -8,14 +8,14 @@ Fuente: `Metricas_run05_b3_v2.xlsx` (hojas `LEEME`, `Config`, `IoU_por_clase`, `
 |---|---|---|
 | modelo | `nvidia/mit-b3` | `model: {arch: segformer, hf_name: nvidia/mit-b3}` |
 | crop | 1024 | `data.crop: 1024` |
-| esc_entr | [0.5, 1.0] | `data.scale_range: [0.5, 1.0]` |
+| esc_entr | [0.5, 1.0] | `data.scale_range: [0.5, 1.0]` (ver interpretación abajo) |
 | esc_inf | 0.75 | `infer.scale: 0.75` |
 | lote | 8 | `train.batch: 8` (efectivo; con acumulación si la GPU no da) |
 | lr | 6e-05 | `optim.lr: 6.0e-5` |
 | epocas_max | 100 | `train.epochs: 100` |
 | muestras_epoca | 880 | `data.samples_per_epoch: 880` (110 pasos de 8) |
 | paciencia | 15 | `train.patience: 15` |
-| semilla | 42 | primera de nuestras semillas (42, 43, 44) |
+| semilla | 42 | nuestra semilla por defecto (42; extra con `EXTRA_SEEDS`) |
 | pesos_clase | None | `loss.weights: none` |
 | torch / transformers | 2.11.0+cu130 / 5.20.2 | se usa lo que trae Colab; las versiones quedan en `env.json` |
 
@@ -23,6 +23,14 @@ Fuente: `Metricas_run05_b3_v2.xlsx` (hojas `LEEME`, `Config`, `IoU_por_clase`, `
 
 - Selección del checkpoint "mejor max-min" (época 32 de 47): se interpreta como **maximizar el IoU mínimo por clase en validación** → `train.select: maxmin`. El `Log_epocas` (columnas `min_criterio`, `media_criterio`) concuerda con esa lectura.
 - Su `sin_clase` se entrenaba como clase y solo se excluía del criterio. En nuestro protocolo, *background* (sin anotar) se **ignora** en pérdida, métricas y matriz de confusión en todos los pasos, M-b3 incluido. Esta diferencia es deliberada.
+
+## Implementado, con interpretación propia (SUPUESTO)
+
+| Aspecto | Cómo está implementado | Dónde |
+|---|---|---|
+| **(a) esc_entr [0.5, 1.0]** | Sí. Por cada muestra se sortea s ~ **Uniforme continua [0.5, 1.0]**, se recorta una ventana de 1024/s px nativos (1024–2048 px) y se reescala a 1024×1024 (bilineal la imagen, vecino más cercano la máscara). Equivale a reescalar la foto por s y recortar 1024. **Supuesto:** distribución uniforme continua y reescalado por muestra (no por foto ni por época). | `segpipe/data.py::CropDataset` |
+| **(b) mejor_maxmin** | Sí. En cada época se calcula el IoU por clase en val (matriz de confusión acumulada a resolución nativa) y se guarda `best.pt` cuando **mejora el mínimo** de esos IoU. La paciencia (15) cuenta épocas sin mejorar ese mínimo. **Supuesto:** el mínimo se toma sobre las clases presentes en ≥ 1 foto de val (`select_min_photos: 1`), sin background; Mauricio excluía `sin_clase` del criterio. | `segpipe/train.py` (`select: maxmin`) |
+| esc_inf 0.75 | Foto completa reescalada a 0.75; ventana deslizante sobre esa foto; logits devueltos a la resolución nativa (bilineal) antes del argmax. | `segpipe/infer.py` |
 
 ## Supuesto (no está en la hoja; valores típicos de SegFormer)
 

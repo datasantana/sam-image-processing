@@ -3,9 +3,10 @@
 Primera aproximación del proyecto de grado (MSc MGITG): segmentación semántica de fotos oblicuas de dron. El repo contiene:
 
 - **`segpipe/`** — *pipeline configurable por esquema de clases*: obtención y validación del dataset, split espacial por bloques, entrenamiento con checkpoints y reanudación, métricas con IC por bootstrap y tabla comparativa. Probado con `pytest` en CPU.
-- **`notebooks/train_ablation.ipynb`** — orquesta en Colab la escalera de ablación J0–J3 y la variante M-b3 (receta de un compañero).
+- **`notebooks/train_ablation.ipynb`** — orquesta en Colab la corrida de humo, la estimación de costo, la escalera de ablación J0–J3, la variante M-b3 (receta de un compañero) y los controles J0-pasos y J0-b75.
 - **`notebooks/automatic_mask_generator_example.ipynb`** — SAM 2 para pre-anotar fotos y exportar COCO a CVAT.
-- **`notebooks/legacy/semantic_segmentation_training.ipynb`** — notebook original, sin cambios (registro histórico; usaba Azure Blob Storage, que ya no existe).
+
+El notebook de entrenamiento original ya no está en el árbol; queda en el historial de git (`git show 9c3f171:notebooks/semantic_segmentation_training.ipynb`).
 
 ---
 
@@ -16,21 +17,21 @@ sam-image-processing/
 ├── segpipe/
 │   ├── data_io.py     # descarga (Drive API / Drive montado / local), sha256, extracción, validación
 │   ├── classes.py     # esquema desde classes.json, clases ignoradas, mapeo fino→grueso, RGB→índice
-│   ├── split.py       # centro de huella oblicua, bloques espaciales, k pliegues con buffer
+│   ├── split.py       # huella de la cámara, bloques espaciales, k pliegues con buffer, solape residual
 │   ├── data.py        # fotos en RAM, aumentos, datasets Resize (J0) y recortes nativos (J1+)
 │   ├── models.py      # DeepLabv3+, PSPNet, UNet++ (smp) y SegFormer (transformers)
 │   ├── losses.py      # Dice + CE ponderada, CE, focal; ignore_index
 │   ├── infer.py       # inferencia resize o ventana deslizante → logits a resolución nativa
 │   ├── metrics.py     # matriz de confusión, mIoU/OA/mAcc/mF1, clases no evaluables, bootstrap
 │   ├── train.py       # una corrida: AMP, acumulación, checkpoint por época, reanudación
-│   ├── runner.py      # estudio (dataset + split) y cola config × semilla × pliegue
+│   ├── runner.py      # estudio (dataset + split), humo, estimación de costo y cola config × semilla × pliegue
 │   ├── report.py      # tabla comparativa entre configs
 │   ├── config.py      # configs YAML con herencia (base:)
 │   └── env.py         # GPU, micro-lote, workers, versiones, commit
 ├── configs/
 │   ├── datasets/pascual.yaml       # file ID, sha256, rutas, clases ignoradas, columnas de geometría
-│   └── runs/J0.yaml … J3.yaml, M-b3.yaml (+ J2-loss, PSPNet, UNetPP opcionales)
-├── notebooks/  (train_ablation, automatic_mask_generator_example, legacy/)
+│   └── runs/J0 … J3, M-b3, J0-pasos, J0-b75 (+ J2-loss, PSPNet, UNetPP opcionales)
+├── notebooks/  (train_ablation, automatic_mask_generator_example)
 ├── tools/pack_dataset.py           # construye el segpack desde la exportación de CVAT
 ├── docs/  (smoke_run.md, mauricio_config.md)
 ├── tests/                          # pytest en CPU con datos sintéticos
@@ -67,10 +68,12 @@ Siempre se verifica el tamaño y el sha256 del zip, se descomprime al disco loca
 
 ## Protocolo de evaluación (siempre activo)
 
-- **Split espacial por bloques.** Cada foto se representa por el centro aproximado de su huella en tierra, no por la posición del dron: `d = RelativeAltitude / tan(|GimbalPitch|)` (≈ 59 m) en la dirección de `GimbalYawDegree`. Los centros se agrupan en una grilla de **150 m** (≈ tamaño de una huella). Los bloques completos se reparten en **k = 5 pliegues**, balanceando el nº de fotos y la presencia de clases raras. En el pliegue *f*: test = *f*, val = *f*+1, train = el resto **menos las fotos a < 50 m** (buffer) de cualquier foto de val o test. Con el pack real quedan 31–39 fotos de train, 12–16 de val y 12–16 de test por pliegue; se excluyen 2–7 por el buffer.
-  - Limitación: la huella oblicua mide ≈ 120 m de fondo. Un buffer de 50 m quita las fotos casi duplicadas, pero no todo el solape: eliminarlo dejaría casi sin train. La distancia mínima train↔val/test de cada pliegue queda en el reporte del split.
-  - Con 66 fotos un split fijo es frágil: con val y test de ~13 fotos, varias clases quedarían "no evaluables". Por eso el protocolo del artículo es **CV por bloques**: al juntar el test de todos los pliegues, cada foto se evalúa exactamente una vez y todas las clases tienen ≥ 12 fotos de test. `PROTOCOL="fixed"` usa solo el pliegue 0.
-  - Las listas de cada partición se guardan en `STUDY_DIR/splits/` (`splits.json`, `fold<k>.csv`, `split_report.txt`).
+- **Split espacial por bloques ("fuga reducida").** Cada foto se representa por su **huella en tierra**, no por la posición del dron. Con la calibración de Metashape (f = 6.72 mm, píxel = 0.0026188 mm, 4032×2268 → FOV 76.3° × 47.7°), las 4 esquinas de la imagen se proyectan a un plano a `RelativeAltitude` bajo el dron, orientando la cámara con el yaw/pitch/roll del gimbal. Supuestos: terreno plano, punto principal centrado, sin distorsión. Con pitch −45° y 58.7 m, la huella va de 23 a 152 m delante del dron y mide ~91 m de ancho en el borde cercano y ~238 m en el lejano. El **centro** de la foto es el centroide del polígono (≈ 96 m del dron).
+  - Los centros se agrupan en una grilla de **150 m**. La fecha de vuelo no interviene: 9 de los 19 bloques mezclan fotos de los dos vuelos. Los bloques completos se reparten en **k = 5 pliegues**, balanceando el nº de fotos y la presencia de clases raras. En el pliegue *f*: test = *f*, val = *f*+1, train = el resto **menos las fotos a < 50 m** (buffer, entre centros) de cualquier foto de val o test.
+  - Con el pack real (buffer 50 m) quedan 33–39 fotos de train, 12–15 de val y 12–15 de test por pliegue, y se excluyen 2–7 por el buffer. La distancia mínima entre centros train↔test va de 54 a 66 m.
+  - **Fuga reducida, no eliminada:** las huellas de train todavía cubren el **38–60 %** del área de las huellas de test. Con buffer de 75 m (corrida de sensibilidad J0-b75) baja a 32–46 %, con 23–32 fotos de train. Un buffer entre centros no puede eliminar el solape de huellas de ~150 × 90–240 m sin dejar el train casi vacío. El reporte del split da, por pliegue, la distancia mínima train↔test y el % de solape residual train→test y train→val (rasterizado a 2 m).
+  - Con 66 fotos un split fijo es frágil. Por eso el protocolo del artículo es **CV por bloques**: al juntar el test de todos los pliegues, cada foto se evalúa exactamente una vez y todas las clases tienen ≥ 12 fotos de test. `PROTOCOL="fixed"` usa solo el pliegue 0.
+  - Las listas de cada partición se guardan en `STUDY_DIR/splits/` (`splits.json`, `fold<k>.csv`, `split_report.txt`; `splits/buffer75/` para J0-b75, con la misma asignación de bloques).
 - **Métricas** desde matrices de confusión por foto a **resolución nativa**: mIoU, OA, mAcc, mF1 y métricas por clase (IoU, recall, precisión, F1). Una clase presente en < **K = 5** fotos de la partición evaluada se marca **"no evaluable"** y se excluye de mIoU/mAcc/mF1, y queda explícito en la salida. **IC 95 % por bootstrap remuestreando fotos** (2000 réplicas). Salida JSON + CSV por corrida.
 - La selección del checkpoint y el early stopping usan solo val. Test se evalúa una vez, con `best.pt`.
 
@@ -88,7 +91,14 @@ Cada paso cambia una sola cosa respecto al anterior (`segpipe.runner.describe_la
 | **J3** | modelo | SegFormer **mit-b3** (`nvidia/mit-b3`, transformers); el resto es idéntico a J2. |
 | **M-b3** | aparte | Receta de Mauricio (aprox.) sobre nuestro dataset y protocolo; ver [docs/mauricio_config.md](docs/mauricio_config.md) para lo tomado de su hoja Config y lo supuesto. |
 
-También quedan registrados **PSPNet** y **UNet++** (`configs/runs/PSPNet.yaml`, `UNetPP.yaml`: J2 con otro modelo), fuera de la cola por defecto.
+Controles fuera de la escalera (en la cola por defecto):
+
+| Config | Para qué | Detalle |
+|---|---|---|
+| **J0-pasos** | confusor de J1 (resolución + nº de pasos) | J0 con 880 muestras/época (fotos repetidas en ciclo, cada una con su aumento) → mismo presupuesto máximo de pasos que J1 (50 × 110 = 5500). **J0-pasos → J1** aísla el efecto de la resolución. Los pasos de optimización realizados (total y al mejor checkpoint) quedan en `epoch_log.csv`, `DONE.json` y la tabla final. |
+| **J0-b75** | sensibilidad a la fuga | J0 con buffer de 75 m: misma asignación de bloques, por lo tanto mismos val y test, y menos train. |
+
+También quedan registrados **PSPNet** y **UNet++** (`configs/runs/PSPNet.yaml`, `UNetPP.yaml`: J2 con otro modelo) y `J2-loss`, fuera de la cola por defecto.
 
 ---
 
@@ -98,10 +108,10 @@ También quedan registrados **PSPNet** y **UNet++** (`configs/runs/PSPNet.yaml`,
 
 1. Abre `notebooks/train_ablation.ipynb` con el badge de Colab (o *Archivo → Abrir cuaderno → GitHub*). Elige GPU (A100 o L4).
 2. **Sección 1:** clona el repo en `/content/sam-image-processing` e instala solo los paquetes que falten. Se usa el torch que trae Colab, sin reinstalarlo ni fijar `cu118`.
-3. **Sección 2:** monta Drive y define `STUDY_DIR` (en Drive), `PROTOCOL`, `CONFIGS` y `SEEDS`.
+3. **Sección 2:** monta Drive y define `STUDY_DIR` (en Drive), `PROTOCOL`, `CONFIGS` y `SEEDS` (por defecto una sola, 42; `EXTRA_SEEDS` añade más).
 4. **Sección 3:** obtiene y valida el dataset (pide autorizar tu cuenta la primera vez), construye o reutiliza el split y reporta los píxeles ignorados.
-5. **Sección 4 (recomendado la primera vez):** corrida de humo; ver [docs/smoke_run.md](docs/smoke_run.md).
-6. **Sección 5:** cola de corridas. **Si la sesión se corta, vuelve a ejecutar las secciones 1–3 y la misma celda de la sección 5**: cada corrida continúa desde su último `last.pt` y las terminadas se saltan.
+5. **Sección 4 (primero, siempre):** corrida de humo de J0, J3, J1, J2 y M-b3, con interrupción y reanudación; luego **tiempo medido por época** y **estimación de horas de GPU** de la cola completa. Ver [docs/smoke_run.md](docs/smoke_run.md).
+6. **Sección 5:** cola de corridas, solo después de revisar la estimación. **Si la sesión se corta, vuelve a ejecutar las secciones 1–3 y la misma celda de la sección 5**: cada corrida continúa desde su último `last.pt` y las terminadas se saltan.
 7. **Sección 6:** tabla comparativa para el artículo.
 
 ### Desde VS Code
@@ -110,7 +120,9 @@ Con la extensión de Colab para VS Code (*Select Kernel → Colab → New Colab 
 
 ### Recursos y tiempo
 
-GPU, micro-lote y workers se detectan automáticamente. El batch efectivo de cada config se mantiene con acumulación de gradiente si no cabe en la GPU. Se usa AMP (bf16 si la GPU lo soporta; si no, fp16 con GradScaler). Puedes forzar el micro-lote con `train.micro_batch` en el YAML. La cola completa con CV es 5 configs × 3 semillas × 5 pliegues = **75 corridas**: planifica varias sesiones y usa `MAX_RUNS` para limitar cada una.
+Cola por defecto, en orden: **J0 → J3 → J1 → J2 → M-b3 → J0-pasos → J0-b75**. Cada config completa (todos sus pliegues) antes de la siguiente, con 1 semilla: 7 configs × 1 semilla × 5 pliegues = **35 corridas**, más 5 corridas cortas de humo en un estudio aparte. Cada semilla extra suma 35.
+
+GPU, micro-lote y workers se detectan automáticamente. El batch efectivo de cada config se mantiene con acumulación de gradiente si no cabe en la GPU. Se usa AMP (bf16 si la GPU lo soporta; si no, fp16 con GradScaler). Puedes forzar el micro-lote con `train.micro_batch` en el YAML. Usa `MAX_RUNS` para limitar las corridas de cada sesión.
 
 ---
 
@@ -121,13 +133,14 @@ from segpipe.runner import prepare_study, run_queue
 from segpipe import report
 study = prepare_study("/content/drive/MyDrive/segpipe/pascual_v1", "configs/datasets/pascual.yaml",
                       protocol="cv", k=5, block_m=150, buffer_m=50, split_seed=0)
-run_queue(study, ["J0", "J1", "J2", "J3", "M-b3"], seeds=[42, 43, 44])
-res = report.build("/content/drive/MyDrive/segpipe/pascual_v1", ["J0", "J1", "J2", "J3", "M-b3"])
+CONFIGS = ["J0", "J3", "J1", "J2", "M-b3", "J0-pasos", "J0-b75"]
+run_queue(study, CONFIGS, seeds=[42])          # semillas extra: seeds=[42, 43, 44]
+res = report.build("/content/drive/MyDrive/segpipe/pascual_v1", CONFIGS)
 ```
 
-Cada corrida (`STUDY_DIR/runs/<config>/seed<s>/fold<f>/`) guarda: `config.json` (config resuelta), `split.json`, `env.json` (GPU, versiones de librerías, commit de git y estado *dirty*, una entrada por sesión), `epoch_log.csv` (pérdida, mIoU/min-IoU/OA de val, IoU por clase, lr, segundos), `best.pt`, `val/` y `test/` (`metrics.json`, `metrics_per_class.csv`, `photo_confusion.npz`) y `DONE.json`. `last.pt` (modelo, optimizador, scheduler, scaler, época, mejor métrica, paciencia, historial y estado RNG) se reescribe de forma atómica en cada época y se borra al terminar.
+Cada corrida (`STUDY_DIR/runs/<config>/seed<s>/fold<f>/`) guarda: `config.json` (config resuelta), `split.json`, `env.json` (GPU, versiones de librerías, commit de git y estado *dirty*, una entrada por sesión), `epoch_log.csv` (pérdida, mIoU/min-IoU/OA de val, IoU por clase, lr, segundos totales/train/val, muestras, pasos de optimización acumulados), `best.pt`, `val/` y `test/` (`metrics.json`, `metrics_per_class.csv`, `photo_confusion.npz`) y `DONE.json`. `last.pt` (modelo, optimizador, scheduler, scaler, época, mejor métrica, paciencia, historial y estado RNG) se reescribe de forma atómica en cada época y se borra al terminar.
 
-`STUDY_DIR/results/` contiene `comparison.md` (tablas listas para el artículo), `summary.csv`, `per_class.csv`, `deltas.csv` y `comparison.json`: media ± DE entre semillas, IC 95 % por bootstrap de fotos para la media entre semillas, IoU por clase y diferencias pareadas de mIoU entre pasos (J0→J1→J2→J3 y cada config vs J0).
+`STUDY_DIR/results/` contiene `comparison.md` (tablas listas para el artículo), `summary.csv`, `per_class.csv`, `deltas.csv` y `comparison.json`: media ± DE entre semillas, IC 95 % por bootstrap de fotos para la media entre semillas, IoU por clase, pasos de optimización (total / al mejor checkpoint), buffer y solape residual train→test, y diferencias pareadas de mIoU: J0→J1→J2→J3, cada control vs J0, **J0-pasos → J1** y J3 → M-b3.
 
 Para cambiar algo, crea un YAML nuevo con `base: J2.yaml` y solo los campos que cambian. Un `run_dir` existente rechaza una config distinta, así que no se mezclan resultados.
 
@@ -163,7 +176,7 @@ Para cambiar algo, crea un YAML nuevo con `base: J2.yaml` y solo los campos que 
      El YAML de Mauricio llevaría su propio `mapping` (p. ej. `via_pavimentada → superficie_pavimentada`, `vegetacion_alta`/`vegetacion_baja → vegetacion`), con el mismo `target`, para comparar ambos datasets en el esquema común.
 4. Usa un `STUDY_DIR` distinto y `prepare_study(STUDY_DIR, "configs/datasets/mauricio.yaml", …)`. Las mismas configs J0–J3/M-b3 sirven: el número de clases sale del esquema.
 
-Hoy el mapeo se aplica a las etiquetas antes de entrenar (el modelo aprende el esquema común). Evaluar en el esquema común un modelo entrenado con el esquema fino (re-mapear predicciones) **no está implementado todavía**.
+Hoy el mapeo se aplica a las etiquetas antes de entrenar (el modelo aprende el esquema común). **Pendiente (después del humo):** evaluar un modelo de 12 clases en el esquema común sumando filas y columnas de su matriz de confusión fino→grueso. Las matrices por foto ya se guardan (`photo_confusion.npz`), así que no hará falta reentrenar.
 
 ---
 

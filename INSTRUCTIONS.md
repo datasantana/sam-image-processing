@@ -2,7 +2,7 @@
 
 This document captures the architectural decisions, known limitations, and concrete directions for improving the `sam-image-processing` project. It is written for contributors (human or AI) who will iterate on the codebase.
 
-> **Major restructuring (2026-11-14, branch `feat/segpipe-ablation`).** Training logic moved out of the notebook into the tested `segpipe/` package; Azure Blob Storage (no longer exists) was replaced by a verified Google Drive archive; the random 80/20 split was replaced by a spatial block split; `background` is now ignored instead of trained. Sections 12–14 below are **historical plans written for the legacy notebook** and are kept for context; each one has a banner with its current status.
+> **Major restructuring (2026-11-14, branch `feat/segpipe-ablation`).** Training logic moved out of the notebook into the tested `segpipe/` package; the old cloud bucket (no longer exists) was replaced by a verified Google Drive archive; the random 80/20 split was replaced by a spatial block split; `background` is now ignored instead of trained. Sections 12–14 below are **historical plans written for the original notebook** (removed from the tree; available in git history) and are kept for context; each one has a banner with its current status.
 
 ---
 
@@ -16,8 +16,7 @@ This document captures the architectural decisions, known limitations, and concr
 | `configs/datasets/pascual.yaml` | Dataset config (Drive file ID, sha256, sizes, paths, ignored classes, geometry columns) | Verified against the real `segpack_v1.zip` |
 | `configs/runs/*.yaml` | Ablation steps J0–J3, M-b3 (+ optional J2-loss, PSPNet, UNetPP) with `base:` inheritance | — |
 | `notebooks/train_ablation.ipynb` | Thin Colab orchestration: setup, study, smoke run, queue, comparison table | Syntax-checked; not executed on Colab yet |
-| `notebooks/automatic_mask_generator_example.ipynb` | SAM 2 zero-shot masks → COCO JSON for CVAT; images now come from the segpack (`ensure_dataset`) | I/O cells rewritten (Azure removed); not re-executed |
-| `notebooks/legacy/semantic_segmentation_training.ipynb` | Original training notebook, **unchanged** (historical record; its Azure cells no longer work) | Frozen |
+| `notebooks/automatic_mask_generator_example.ipynb` | SAM 2 zero-shot masks → COCO JSON for CVAT; images come from the segpack (`ensure_dataset`), results to local disk or mounted Drive | I/O cells rewritten (SAM logic untouched); not re-executed |
 | `tools/pack_dataset.py` | Builds the segpack from a CVAT "Segmentation mask 1.1" export | Used to build `segpack_v1.zip` |
 | `tests/` | pytest suite (CPU) | See README "Pruebas locales" |
 
@@ -35,17 +34,17 @@ This document captures the architectural decisions, known limitations, and concr
 ### 2.1 Package + thin notebook
 Colab is the only GPU runtime (no local GPU). Logic lives in `segpipe/` so it can be unit-tested on CPU; the notebook only clones the repo, sets parameters and calls `prepare_study` / `run_queue` / `report.build`.
 
-### 2.2 ~~Why Azure Blob Storage?~~ → Verified Drive archive
-> **Replaced** (2026-11-14). Azure Blob Storage no longer exists and images cannot be re-downloaded from CVAT. The dataset is a single archive (`segpack_v1.zip`) in Google Drive. `segpipe.data_io.ensure_dataset` fetches it (validated local copy → Drive API with the user's account → mounted Drive → `SEGPACK_DIR`/`SEGPACK_ZIP`), checks size + sha256, extracts to the VM's local disk and validates against `manifest.csv`. A Colab kernel cannot see the user's local disk/OneDrive, so nothing depends on them. No secrets or connection strings are stored anywhere.
+### 2.2 Dataset storage: verified Drive archive
+> **Changed** (2026-11-14). The original cloud bucket no longer exists and images cannot be re-downloaded from CVAT. The dataset is a single archive (`segpack_v1.zip`) in Google Drive. `segpipe.data_io.ensure_dataset` fetches it (validated local copy → Drive API with the user's account → mounted Drive → `SEGPACK_DIR`/`SEGPACK_ZIP`), checks size + sha256, extracts to the VM's local disk and validates against `manifest.csv`. A Colab kernel cannot see the user's local disk/OneDrive, so nothing depends on them. No secrets or connection strings are stored anywhere.
 
 ### 2.3 Loss
-J0 keeps the legacy loss (Dice + inverse-frequency weighted CE). Other losses (`ce`, `focal`, `dice_focal`, `sqrt_inverse_freq` weights) are config options. All losses use `ignore_index=255` for unannotated pixels.
+J0 keeps the original loss (Dice + inverse-frequency weighted CE). Other losses (`ce`, `focal`, `dice_focal`, `sqrt_inverse_freq` weights) are config options. All losses use `ignore_index=255` for unannotated pixels.
 
 ### 2.4 ~~Configurable random split~~ → Spatial block split
-> **Replaced** (2026-11-14). `train_test_split(0.8, seed 42)` leaked information: neighbouring oblique photos see the same ground. `segpipe.split` uses the approximate ground-footprint centre (GPS + `RelativeAltitude / tan(|GimbalPitch|)` along `GimbalYawDegree`), 150 m grid blocks, k = 5 block folds (test = f, val = f+1) and a 50 m buffer excluding train photos near val/test. Rationale and numbers: README "Protocolo de evaluación".
+> **Replaced** (2026-11-14). `train_test_split(0.8, seed 42)` leaked information: neighbouring oblique photos see the same ground. `segpipe.split` projects the 4 image corners to a flat ground plane using the Metashape calibration (f 6.72 mm, pixel 0.0026188 mm, 4032×2268 → FOV 76.3° × 47.7°; `geometry.camera` in the dataset YAML) and the gimbal yaw/pitch/roll. The photo centre is the polygon centroid (≈ 96 m ahead of the drone). Centres go into 150 m grid blocks; the flight date plays no role (9 of 19 blocks mix both flights). There are k = 5 block folds (test = f, val = f+1) and a 50 m centre buffer that excludes train photos near val/test. Each fold reports the min train↔test distance and the **residual footprint overlap** (area of test footprints covered by train footprints, 2 m raster). Call this "reduced leakage" ("fuga reducida"), never "no leakage". Rationale and numbers: README "Protocolo de evaluación".
 
 ### 2.5 Class schema from `classes.json`
-`classes.json` (ordered `index, name, rgb`) is the single source of truth; `labelmap.txt` is no longer parsed. RGB→index is vectorized and **fails on unknown colours**. `background` (black, no CVAT polygon) is ignored in loss, metrics and confusion matrix in every step, including J0 — a correction vs. the legacy notebook, which trained it as a class.
+`classes.json` (ordered `index, name, rgb`) is the single source of truth; `labelmap.txt` is no longer parsed. RGB→index is vectorized and **fails on unknown colours**. `background` (black, no CVAT polygon) is ignored in loss, metrics and confusion matrix in every step, including J0 — a correction vs. the original notebook, which trained it as a class.
 
 ### 2.6 Metrics
 Per-photo confusion matrices at native resolution (4032×2268); mIoU/OA/mAcc/mF1 + per class; classes present in < K photos (default 5) of the evaluated partition are "not evaluable" and excluded from the means (listed explicitly); 95 % CIs by bootstrapping photos. With block CV the test predictions of all folds are pooled (each photo tested once).
@@ -57,24 +56,25 @@ Per-sample randomness derives from (seed, epoch, index); `last.pt` stores model/
 
 ## 3. Known Limitations & Technical Debt
 
-Items 3.1–3.8 describe the legacy notebook; their status in `segpipe` is noted.
+Items 3.1–3.8 describe the original training notebook (removed from the tree; see git history, e.g. `git show 9c3f171:notebooks/semantic_segmentation_training.ipynb`); their status in `segpipe` is noted.
 
 - **3.1 RGB mask conversion speed** — ✅ vectorized (`ClassSchema.rgb_to_index`).
 - **3.2 Binary IoU** — ✅ per-class from confusion matrices (`segpipe.metrics`).
 - **3.3 Early stopping** — ✅ `train.patience`.
-- **3.4 Fragile labelmap parsing** — ✅ RESOLVED (2026-11-14): `classes.json` is used instead; the legacy header bug produced 14 classes.
+- **3.4 Fragile labelmap parsing** — ✅ RESOLVED (2026-11-14): `classes.json` is used instead; the original labelmap-header bug produced 14 classes.
 - **3.5 No data validation** — ✅ RESOLVED (2026-11-14): archive sha256/size, pair completeness, image/mask sizes vs. manifest, unknown mask colours.
 - **3.6 LR plot** — ✅ `lr` logged per epoch in `epoch_log.csv`.
 - **3.7 Standard metrics** — ✅ mIoU/OA/mAcc/mF1 + bootstrap CIs.
-- **3.8 Recipe under-optimized** — now studied as the J0–J3 ablation. Legacy Run 1–5 numbers below were measured with the leaky random split, 14 classes and `background` as a class; **they are not comparable** with new results.
+- **3.8 Recipe under-optimized** — now studied as the J0–J3 ablation. Original-notebook Run 1–5 numbers below were measured with the leaky random split, 14 classes and `background` as a class; **they are not comparable** with new results.
 
 New limitations:
-- **3.9 Residual spatial overlap.** The 50 m buffer removes near-duplicate photos but not all footprint overlap (~120 m deep footprint). Report `min_dist_train_heldout_m` per fold.
-- **3.10 Small dataset.** 66 photos → train 31–39 per fold; seed variance can be large. Report mean ± SD over seeds and photo-bootstrap CIs.
+- **3.9 Residual footprint overlap (reduced, not removed leakage).** Footprints are ~150 m deep and 90–240 m wide, so a centre buffer cannot remove overlap without emptying train. With the real pack, train footprints cover 38–60 % of test footprint area at 50 m and 32–46 % at 75 m. Report `min_dist_train_test_m` and `overlap_train_test_pct` per fold; J0-b75 measures sensitivity.
+- **3.10 Small dataset.** 66 photos → train 33–39 per fold at 50 m (23–32 at 75 m). The default is one seed (42); add seeds with `EXTRA_SEEDS` if the budget allows. Report photo-bootstrap CIs.
 - **3.11 M-b3 is approximate.** Several hyperparameters are inferred; see `docs/mauricio_config.md`.
-- **3.12 J1 changes the epoch definition.** J0 epochs are one pass over ~35 resized photos; J1+ epochs are 880 native crops (as in Mauricio's recipe), so J1+ get more optimizer steps. This is part of the J1 change and should be stated in the paper.
+- **3.12 J1 confound (resolution + number of steps).** J0 epochs are one pass over ~35 resized photos (~4 optimizer steps); J1+ epochs are 880 native crops (110 steps). The control **J0-pasos** (J0 with 880 samples/epoch) has the same step budget as J1, so J0-pasos → J1 isolates resolution. Every run logs cumulative optimizer steps (`opt_steps`), and the final table reports total steps and steps at the best checkpoint.
+- **3.13 Flat-ground footprint.** Footprints assume flat ground at `RelativeAltitude`, a centred principal point and no distortion; buildings and terrain relief shift the true footprint.
 
-<details><summary>Legacy run log (historical, not comparable)</summary>
+<details><summary>Original-notebook run log (historical, not comparable)</summary>
 
 | Run | Model | Loss | Best val mIoU | Notes |
 |-----|-------|------|---------------|-------|
@@ -92,8 +92,8 @@ New limitations:
 
 | # | Improvement | Notes |
 |---|-------------|-------|
-| 1 | Run the smoke run and the J0–J3/M-b3 queue on Colab (`docs/smoke_run.md`) | First GPU validation; adjust `train.micro_batch` if the heuristic over/under-fills memory |
-| 2 | Evaluate fine-schema models in a common coarse schema | Needed to compare with Mauricio's 10-class model directly |
+| 1 | Run the smoke run on Colab, review measured epoch times and the cost estimate, then the queue J0 → J3 → J1 → J2 → M-b3 → J0-pasos → J0-b75 (`docs/smoke_run.md`) | First GPU validation; adjust `train.micro_batch` if the heuristic over/under-fills memory |
+| 2 | **After the smoke run:** evaluate a 12-class model in the common coarse schema by aggregating its confusion matrix fine→coarse | Needed to compare with Mauricio's 10-class model; per-photo matrices (`photo_confusion.npz`) are already saved, no retraining needed |
 | 3 | Add Mauricio's dataset (`configs/datasets/mauricio.yaml`) | Needs its segpack (same format) and an agreed common schema |
 | 4 | Inference script for unlabeled photos (+ GeoTIFF/point-cloud projection) | — |
 | 5 | CI running `pytest` on push | — |
@@ -124,7 +124,7 @@ See README "Añadir otro dataset". In short: build a segpack with `tools/pack_da
 | `model.arch` / `encoder` / `hf_name` | `deeplabv3plus` / `resnet50` / — | `segformer` uses `hf_name` (`nvidia/mit-b3`) |
 | `data.mode` | `resize` | `crops` = native-resolution random crops |
 | `data.resize` / `crop` | 512 / 1024 | |
-| `data.samples_per_epoch` | — | crops per epoch (880 in J1+) |
+| `data.samples_per_epoch` | — | samples per epoch (880 in J1+ and J0-pasos); in `resize` mode photos repeat in a cycle |
 | `data.scale_range` | — | random rescale before cropping (M-b3: [0.5, 1.0]) |
 | `data.sampler`, `rare_p`, `rare_classes`, `rare_px_frac` | `uniform`, 0.5, `auto`, 0.01 | `rare` = crops centred on rare-class pixels |
 | `data.augment` | `legacy` | `hflip`, `none` |
@@ -136,8 +136,12 @@ See README "Añadir otro dataset". In short: build a segpack with `tools/pack_da
 | `train.epochs`, `patience`, `select` | 50, 10, `miou` | `maxmin` = maximize min per-class val IoU |
 | `train.amp` | true | bf16 if supported, else fp16 + GradScaler |
 | `eval.min_photos`, `n_boot` | 5, 2000 | "not evaluable" threshold K; bootstrap replicates |
+| `split.buffer_m` | — (study's 50 m) | per-config buffer with the same block assignment (J0-b75: 75) |
+| `reference` | — | config used only by `describe_ladder` for the diff (M-b3 → J3) |
 
-Study-level parameters (`prepare_study`): `protocol` (`cv`/`fixed`), `k` = 5, `block_m` = 150, `buffer_m` = 50, `split_seed` = 0.
+Study-level parameters (`prepare_study`): `protocol` (`cv`/`fixed`), `k` = 5, `block_m` = 150, `buffer_m` = 50, `split_seed` = 0. Dataset-level geometry (`geometry.camera`: `focal_mm`, `pixel_mm`, `width`, `height`, `max_range_m`; `flight_regex` for diagnostics).
+
+Default queue (`runner.DEFAULT_QUEUE`, run config → seed → fold): J0, J3, J1, J2, M-b3, J0-pasos, J0-b75 with seed 42 → 7 × 1 × 5 = **35 runs** (+ 5 short smoke runs in a separate study).
 
 ---
 
@@ -146,7 +150,8 @@ Study-level parameters (`prepare_study`): `protocol` (`cv`/`fixed`), `k` = 5, `b
 | Term | Definition |
 |------|-----------|
 | **Semantic segmentation** | Classifying every pixel in an image into a predefined category |
-| **Footprint centre** | Approximate ground point at the centre of an oblique photo: GPS shifted by h/tan(pitch) along the gimbal yaw |
+| **Footprint / centre** | Ground polygon of an oblique photo (4 image corners projected to a flat plane with the calibrated camera and gimbal angles); centre = polygon centroid |
+| **Residual overlap ("fuga reducida")** | % of the area of held-out footprints covered by train footprints |
 | **Block CV** | Cross-validation where whole spatial blocks go to the same fold, to limit spatial leakage |
 | **Buffer** | Minimum footprint-centre distance between a train photo and any val/test photo |
 | **Not evaluable** | Class present in fewer than K photos of the evaluated partition; excluded from mean metrics |
@@ -168,18 +173,18 @@ Study-level parameters (`prepare_study`): `protocol` (`cv`/`fixed`), `k` = 5, `b
 |------|-------------|
 | `segpipe/data_io.py` | `ensure_dataset`, `download_from_drive`, `download_ranges`, `verify_archive`, `safe_extract`, `validate_extracted` |
 | `segpipe/classes.py` | `ClassSchema.from_json`, `rgb_to_index`, `IGNORE_INDEX = 255` |
-| `segpipe/split.py` | `footprint_centers`, `assign_blocks`, `make_folds`, `save_folds`, `split_report` |
+| `segpipe/split.py` | `camera_fov`, `footprint_polygons`, `footprints`, `FootprintRaster`, `assign_blocks`, `make_folds`, `folds_from_assignment`, `flight_mix`, `save_folds`, `split_report` |
 | `segpipe/data.py` | `PhotoStore`, `build_augment` (legacy aug, albumentations 1.x/2.x), `ResizeDataset`, `CropDataset` |
 | `segpipe/models.py` | `build_model`, `SegFormer` wrapper |
 | `segpipe/losses.py` | `class_weights`, `build_loss` |
 | `segpipe/infer.py` | `predict_logits` (resize / sliding window, optional scale) |
 | `segpipe/metrics.py` | `confusion`, `per_class`, `summarize`, `bootstrap`, `evaluate`, `save_report` |
 | `segpipe/train.py` | `train_run` (checkpoint/resume, final evaluation), `evaluate_photos` |
-| `segpipe/runner.py` | `prepare_study`, `write_ignored_report`, `run_queue`, `describe_ladder` |
-| `segpipe/report.py` | `build`, `to_markdown` |
+| `segpipe/runner.py` | `prepare_study`, `Study.folds_for` (buffer variants), `write_ignored_report`, `run_queue`, `run_smoke`, `smoke_epoch_times`, `estimate_cost`, `describe_ladder` |
+| `segpipe/report.py` | `build`, `default_pairs`, `to_markdown` |
 | `segpipe/config.py` | `load_run_config` (`base:` inheritance), `diff` |
 | `segpipe/env.py` | `gpu_info`, `micro_batch`, `num_workers`, `versions`, `git_commit` |
-| `notebooks/train_ablation.ipynb` | Sections: 1 code/deps, 2 parameters, 3 dataset+split, 4 smoke run, 5 queue, 6 comparison, 7 curves |
+| `notebooks/train_ablation.ipynb` | Sections: 1 code/deps, 2 parameters, 3 dataset+split, 4 smoke run + epoch times + cost estimate, 5 queue, 6 comparison, 7 curves |
 | `notebooks/automatic_mask_generator_example.ipynb` | SAM 2 setup, image source (`ensure_dataset`), mask generation, COCO batch export |
 | `docs/smoke_run.md`, `docs/mauricio_config.md` | Smoke-run procedure; M-b3 provenance |
 
@@ -276,7 +281,7 @@ When fixing a limitation listed in §3 of this document:
 
 ## 12. Wilk et al. (2022) Benchmark Metrics — Full Specification
 
-> **Historical (legacy notebook).** Implemented in `segpipe/metrics.py` (confusion matrix → mIoU/OA/mAcc/mF1, per class, CSV/JSON) with photo-bootstrap CIs and "not evaluable" classes. Cell numbers below refer to `notebooks/legacy/`.
+> **Historical (original notebook, see git history).** Implemented in `segpipe/metrics.py` (confusion matrix → mIoU/OA/mAcc/mF1, per class, CSV/JSON) with photo-bootstrap CIs and "not evaluable" classes. Cell numbers below refer to the original notebook in git history (commit `9c3f171`).
 
 > **Reference:** Wilk, Ł. et al. (2022). "Automatic classification of roof types from 3D building models using semantic segmentation." *ISPRS Archives*, XLIII-B2-2022, 485–492.
 
@@ -413,7 +418,7 @@ For the beginner-guide markdown cell (currently in Spanish), add a subsection ex
 
 ## 13. Architecture-Specific Refinements — Implementation Plans
 
-> **Historical (legacy notebook), not implemented.** To try any of these, add a config with `base: J2.yaml` (or the relevant step) so it remains a single-change ablation. Sliding-window inference (§13.2.2-like, without Gaussian weighting) and UNet++ registration exist in `segpipe`.
+> **Historical (original notebook, see git history), not implemented.** To try any of these, add a config with `base: J2.yaml` (or the relevant step) so it remains a single-change ablation. Sliding-window inference (§13.2.2-like, without Gaussian weighting) and UNet++ registration exist in `segpipe`.
 
 This section specifies per-architecture improvements that go beyond the default SMP configuration. Each subsection includes **rationale, implementation plan, PyTorch code, and new hyperparameters** to add to §7. All refinements preserve the existing metrics pipeline (§5–§6, §12).
 
@@ -1283,7 +1288,7 @@ if USE_OVERSAMPLING and MODEL_ARCH == "UnetPlusPlus":
 
 ## 14. Training Recipe Optimization — Implementation Plan
 
-> **Historical (legacy notebook).** Changes A–C are part of the J0 recipe (`configs/runs/J0.yaml`). Expected results quoted here were measured with the leaky random split and are not comparable.
+> **Historical (original notebook, see git history).** Changes A–C are part of the J0 recipe (`configs/runs/J0.yaml`). Expected results quoted here were measured with the leaky random split and are not comparable.
 
 > **Status:** Planned (2026-03-04).
 > **Goal:** Raise per-class mIoU from ~0.36 to ~0.42–0.50 on 14-class drone/roof segmentation.
