@@ -1,0 +1,28 @@
+# M-b3 — reproducción APROXIMADA de la receta de Mauricio (run05_b3_v2), entrenada en nuestro dataset
+# y protocolo. No es parte de la escalera J0-J3. Ver docs/mauricio_config.md para el detalle.
+#
+# Tomado de la hoja Config:   modelo nvidia/mit-b3, crop 1024, esc_entr [0.5, 1.0], esc_inf 0.75,
+#                             lote 8, lr 6e-5, epocas_max 100, muestras_epoca 880, paciencia 15,
+#                             pesos_clase None.  (semilla 42 = primera de nuestras 3 semillas)
+# Tomado de la hoja LEEME:    selección del checkpoint por "max-min" (máximo del IoU mínimo por clase en val).
+# SUPUESTO (no está en la hoja): AdamW con weight decay 0.01, decaimiento poly (potencia 1.0) por
+#   iteración sin warmup, pérdida CE sin pesos, aumento = reescalado [0.5,1.0] + recorte + flip
+#   horizontal, inferencia = foto reescalada a 0.75 + ventana deslizante 1024 con 50 % de solape,
+#   normalización ImageNet.
+# Corrección común a todos los pasos: background (sin anotar) se ignora; Mauricio entrenaba su
+#   'sin_clase' como clase y la excluía solo del criterio.
+description: "Receta de Mauricio (aprox.): SegFormer mit-b3, AdamW 6e-5 poly, CE, escala [0.5,1], 100 ép., paciencia 15, max-min"
+model: {arch: segformer, hf_name: nvidia/mit-b3, weights: imagenet}
+data:
+  mode: crops
+  crop: 1024
+  samples_per_epoch: 880
+  scale_range: [0.5, 1.0]
+  sampler: uniform
+  augment: hflip
+infer: {mode: sliding, window: 1024, overlap: 0.5, scale: 0.75}
+loss: {name: ce, weights: none}
+optim: {name: adamw, lr: 6.0e-5, weight_decay: 0.01}
+sched: {name: poly, power: 1.0}
+train: {batch: 8, epochs: 100, patience: 15, select: maxmin}
+eval: {min_photos: 5, n_boot: 2000}

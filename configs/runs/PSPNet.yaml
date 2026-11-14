@@ -1,0 +1,4 @@
+# Opción registrada (fuera de la escalera por defecto): J2 con PSPNet ResNet-50.
+base: J2.yaml
+description: "J2 con PSPNet R50"
+model: {arch: pspnet, encoder: resnet50, weights: imagenet}

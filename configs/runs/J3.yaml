@@ -1,0 +1,4 @@
+# J3 = J2 cambiando solo el modelo a SegFormer mit-b3 (transformers). Resto de la receta idéntico a J2.
+base: J2.yaml
+description: "J2 con SegFormer mit-b3 (encoder ImageNet nvidia/mit-b3)"
+model: {arch: segformer, hf_name: nvidia/mit-b3, weights: imagenet}

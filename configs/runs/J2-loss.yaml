@@ -1,0 +1,5 @@
+# Opcional (fuera de la escalera por defecto): alternativa de pérdida para clases raras.
+# = J1 cambiando Dice + CE ponderada (1/frec) por Dice + focal (gamma 2) sin pesos.
+base: J1.yaml
+description: "J1 con Dice + focal (gamma 2) en vez de Dice + CE ponderada"
+loss: {name: dice_focal, weights: none, gamma: 2.0}
