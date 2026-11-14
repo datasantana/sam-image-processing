@@ -1,2 +1,10 @@
 # PDF files
 *.pdf
+
+# Local test env / data / outputs
+.venv/
+.data/
+__pycache__/
+*.pyc
+.pytest_cache/
+/runs/

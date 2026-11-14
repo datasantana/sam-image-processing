@@ -1,0 +1,12 @@
+[project]
+name = "segpipe"
+version = "0.1.0"
+description = "Pipeline configurable por esquema de clases para segmentación semántica de imágenes UAV oblicuas"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["segpipe"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

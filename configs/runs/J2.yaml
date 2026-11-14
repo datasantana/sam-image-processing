@@ -1,0 +1,10 @@
+# J2 = J1 + muestreo de recortes sesgado a clases raras (la pérdida no cambia).
+# Con prob. rare_p se elige una clase rara presente en train y se centra el recorte en uno de sus píxeles.
+# Clases raras "auto" = < 1 % de los píxeles anotados de train (Fence, Lightning Posts, Brownfields, Vehicle).
+base: J1.yaml
+description: "J1 + muestreo de recortes sesgado a clases raras (p=0.5)"
+data:
+  sampler: rare
+  rare_p: 0.5
+  rare_classes: auto
+  rare_px_frac: 0.01

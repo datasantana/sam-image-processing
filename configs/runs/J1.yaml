@@ -1,0 +1,10 @@
+# J1 = J0 + recortes aleatorios a resolución nativa e inferencia por ventana deslizante (sin Resize 512).
+# Hipótesis a medir: el resize (~3-4.5 cm/px -> ~20-25 cm/px) borra clases delgadas (Fence, Lightning Posts).
+# Una época = samples_per_epoch recortes (880, igual que Mauricio, para que J1-J3 y M-b3 compartan la definición).
+base: J0.yaml
+description: "J0 + recortes nativos 1024 (880/época) + ventana deslizante 1024 con 50 % de solape"
+data:
+  mode: crops
+  crop: 1024
+  samples_per_epoch: 880
+infer: {mode: sliding, window: 1024, overlap: 0.5, scale: 1.0}

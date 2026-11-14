@@ -1,0 +1,53 @@
+# Dataset config: estadio Pascual Guerrero (UAV oblicuo), empaquetado segpack_v1.
+# Todo lo específico del dataset vive aquí; segpipe no tiene rutas ni IDs en el código.
+# Para añadir otro dataset (p. ej. el de Mauricio) se copia este archivo y se ajusta.
+
+name: pascual
+version: segpack_v1
+
+archive:
+  filename: segpack_v1.zip
+  size_bytes: 560108771
+  sha256: 1ef52bcb49ef74c05d547f16b042cb9de2371cdd05ddb7119bc84d2c196f41ab
+  # Google Drive (fuente principal). Se descarga con la cuenta del usuario (archivo privado OK).
+  drive_file_id: 1daBp9IWCQMTe-Bza6DVsQwdYhLonFJ7k
+  # Alternativa: Drive montado en /content/drive. Ruta al zip dentro de Mi unidad.
+  drive_mounted_path: /content/drive/MyDrive/segpack_v1.zip
+  # Respaldo manual (no automatizado): OneDrive, ver README.
+
+local:
+  # Raíz en la VM de Colab (disco local, nunca Drive).
+  root_colab: /content/data
+  # Raíz fuera de Colab (solo pruebas). Se puede sobrescribir con SEGPACK_ROOT.
+  root_other: .data
+  extract_dir: segpack_v1
+  env_zip: SEGPACK_ZIP     # ruta a un zip local
+  env_dir: SEGPACK_DIR     # ruta a una carpeta ya descomprimida
+
+layout:
+  classes: classes.json    # fuente de verdad del esquema de clases (index, name, rgb)
+  manifest: manifest.csv
+  class_stats: class_stats.csv
+
+classes:
+  # Píxeles sin polígono en CVAT. Se ignoran en la pérdida, las métricas y la matriz de confusión.
+  ignore: [background]
+
+geometry:
+  # Columnas del manifest usadas para proyectar la huella de la cámara oblicua.
+  lat: GpsLatitude
+  lon: GpsLongitude
+  height: RelativeAltitude
+  pitch: GimbalPitchDegree
+  yaw: GimbalYawDegree
+  roll: GimbalRollDegree
+  # Calibración de Metashape (FOV ≈ 76.3° × 47.7°). Huella = 4 esquinas proyectadas a un plano a
+  # RelativeAltitude bajo el dron; centro = centroide del polígono.
+  camera:
+    focal_mm: 6.72
+    pixel_mm: 0.0026187585746188587
+    width: 4032
+    height: 2268
+    max_range_m: 400
+  # Agrupación por vuelo solo para diagnóstico (no se usa para formar bloques).
+  flight_regex: "DJI_(\\d{8})"

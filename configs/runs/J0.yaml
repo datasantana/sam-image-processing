@@ -1,0 +1,15 @@
+# J0 — receta original (notebook de entrenamiento original, ver historial git) bajo el protocolo corregido.
+# Correcciones siempre activas (no son parte de la ablación): clases desde classes.json,
+# background ignorado (ignore_index), split espacial por bloques, métricas a resolución nativa.
+description: "DeepLabv3+ R50, Resize 512, aumentos originales, Dice + CE ponderada (1/frec), Adam 1e-4, batch 8, 50 épocas, early stopping 10"
+model: {arch: deeplabv3plus, encoder: resnet50, weights: imagenet}
+data:
+  mode: resize
+  resize: 512
+  augment: legacy
+infer: {mode: resize}              # predice a 512 y reescala los logits a 4032x2268
+loss: {name: dice_wce, weights: inverse_freq}
+optim: {name: adam, lr: 1.0e-4, weight_decay: 1.0e-4}
+sched: {name: plateau, factor: 0.5, patience: 5}
+train: {batch: 8, epochs: 50, patience: 10, select: miou}
+eval: {min_photos: 5, n_boot: 2000}

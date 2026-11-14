@@ -1,191 +1,206 @@
-# SAM Image Processing — Drone Imagery Semantic Segmentation
+# SAM Image Processing — segmentación semántica de imágenes UAV oblicuas
 
-End-to-end pipeline for **semantic segmentation** of drone imagery, combining Meta's Segment Anything Model (SAM 2) for automatic mask generation with supervised training of **DeepLabv3+** / **PSPNet** models on CVAT-annotated datasets stored in Azure Blob Storage.
+Primera aproximación del proyecto de grado (MSc MGITG): segmentación semántica de fotos oblicuas de dron. El repo contiene:
+
+- **`segpipe/`** — *pipeline configurable por esquema de clases*: obtención y validación del dataset, split espacial por bloques, entrenamiento con checkpoints y reanudación, métricas con IC por bootstrap y tabla comparativa. Probado con `pytest` en CPU.
+- **`notebooks/train_ablation.ipynb`** — orquesta en Colab la corrida de humo, la estimación de costo, la escalera de ablación J0–J3, la variante M-b3 (receta de un compañero) y los controles J0-pasos y J0-b75.
+- **`notebooks/automatic_mask_generator_example.ipynb`** — SAM 2 para pre-anotar fotos y exportar COCO a CVAT.
+
+El notebook de entrenamiento original ya no está en el árbol; queda en el historial de git (`git show 9c3f171:notebooks/semantic_segmentation_training.ipynb`).
 
 ---
 
-## Repository Structure
+## Estructura
 
 ```
 sam-image-processing/
-├── README.md                              # This file
-├── INSTRUCTIONS.md                        # Deep context for future work
-├── requirements.txt                       # Python dependencies
-└── notebooks/
-    ├── automatic_mask_generator_example.ipynb   # SAM 2 auto-mask + COCO export
-    └── semantic_segmentation_training.ipynb     # DeepLabv3+/PSPNet training
+├── segpipe/
+│   ├── data_io.py     # descarga (Drive API / Drive montado / local), sha256, extracción, validación
+│   ├── classes.py     # esquema desde classes.json, clases ignoradas, mapeo fino→grueso, RGB→índice
+│   ├── split.py       # huella de la cámara, bloques espaciales, k pliegues con buffer, solape residual
+│   ├── data.py        # fotos en RAM, aumentos, datasets Resize (J0) y recortes nativos (J1+)
+│   ├── models.py      # DeepLabv3+, PSPNet, UNet++ (smp) y SegFormer (transformers)
+│   ├── losses.py      # Dice + CE ponderada, CE, focal; ignore_index
+│   ├── infer.py       # inferencia resize o ventana deslizante → logits a resolución nativa
+│   ├── metrics.py     # matriz de confusión, mIoU/OA/mAcc/mF1, clases no evaluables, bootstrap
+│   ├── train.py       # una corrida: AMP, acumulación, checkpoint por época, reanudación
+│   ├── runner.py      # estudio (dataset + split), humo, estimación de costo y cola config × semilla × pliegue
+│   ├── report.py      # tabla comparativa entre configs
+│   ├── config.py      # configs YAML con herencia (base:)
+│   └── env.py         # GPU, micro-lote, workers, versiones, commit
+├── configs/
+│   ├── datasets/pascual.yaml       # file ID, sha256, rutas, clases ignoradas, columnas de geometría
+│   └── runs/J0 … J3, M-b3, J0-pasos, J0-b75 (+ J2-loss, PSPNet, UNetPP opcionales)
+├── notebooks/  (train_ablation, automatic_mask_generator_example)
+├── tools/pack_dataset.py           # construye el segpack desde la exportación de CVAT
+├── docs/  (smoke_run.md, mauricio_config.md)
+├── tests/                          # pytest en CPU con datos sintéticos
+├── requirements.txt  pyproject.toml  INSTRUCTIONS.md
 ```
-
-## Notebooks Overview
-
-### 1. `automatic_mask_generator_example.ipynb` — SAM 2 Automatic Mask Generation
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/datasantana/sam-image-processing/blob/main/notebooks/automatic_mask_generator_example.ipynb)
-
-Generates zero-shot segmentation masks using Meta's **SAM 2** (`SAM2AutomaticMaskGenerator`). Key steps:
-
-| Step | Description |
-|------|-------------|
-| **Environment setup** | Installs SAM 2, PyTorch (CUDA 11.8), pycocotools, Azure SDK |
-| **Grid-based prompting** | Samples single-point prompts across the image |
-| **Mask filtering** | Quality scoring + non-maximal suppression to deduplicate |
-| **COCO export** | Converts masks to COCO-format JSON for ingestion by CVAT |
-| **Azure integration** | Reads/writes imagery and annotations from Azure Blob Storage |
-
-**Use case:** Pre-annotate drone images before manual refinement in CVAT.
 
 ---
 
-### 2. `semantic_segmentation_training.ipynb` — Supervised Segmentation Training
+## Dataset
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/datasantana/sam-image-processing/blob/main/notebooks/semantic_segmentation_training.ipynb)
+`segpack_v1.zip` (560 108 771 bytes, sha256 `1ef52bcb49ef74c05d547f16b042cb9de2371cdd05ddb7119bc84d2c196f41ab`):
 
-Trains pixel-level classification models on CVAT-exported masks. The notebook is divided into four major sections:
+| Contenido | |
+|---|---|
+| `images/<base>.JPG` | 66 fotos oblicuas 4032×2268 (gimbal ≈ −45°, altura relativa ≈ 58.7 m; vuelos del 2025-05-22 y 2025-06-11) |
+| `masks/<base>.png` | máscaras RGB de CVAT |
+| `classes.json` | lista ordenada `index, name, rgb`: **fuente de verdad** del esquema |
+| `manifest.csv` | tamaño, sha256 y metadatos DJI (GPS, altura, gimbal) por foto |
+| `class_stats.csv`, `labelmap.txt`, `REPORT.txt` | píxeles por clase, labelmap de CVAT, reporte de empaquetado |
 
-#### Section 1 — Azure Blob Connection & Download
-- Connects to Azure Blob Storage using a connection string (stored as a Colab secret).
-- Downloads drone images and their corresponding PASCAL-VOC-style annotation masks.
-- Downloads the `labelmap.txt` that maps class names to RGB colors.
+Clases del modelo (12): Brownfields, Buildings, Fence, Ground Surface, Lightning Posts, Parkinglots, Paved Surface, Pools, Road Surface, Sports Fields, Vegetation, Vehicle. **`background` (negro) = píxeles sin polígono en CVAT**: se ignora (`ignore_index`) en la pérdida, las métricas y la matriz de confusión. Es una corrección respecto al notebook original, que lo entrenaba como clase (y, por un bug en la lectura del labelmap, usaba 14 clases; esos checkpoints no son compatibles). El % de píxeles ignorados por foto se reporta en `STUDY_DIR/dataset/ignored_px_per_photo.csv` (en el pack: mediana 22.8 %, rango 8.9–51.4 %).
 
-#### Section 2 — Dataset Preparation
-- Pairs images with masks by matching base filenames.
-- Configurable train/val split: `TRAIN_RATIO` (default 0.8) with `RANDOM_SEED` (default 42) using `sklearn.model_selection.train_test_split`.
-- Reproducible across runs with a fixed random seed.
+**Dónde está:** Google Drive (archivo privado, file ID en `configs/datasets/pascual.yaml`). Hay un respaldo manual en OneDrive cuyo enlace guarda el autor (no está automatizado). Para reconstruirlo desde una exportación de CVAT: `python tools/pack_dataset.py --images DIR --cvat-zip masks.zip --out segpack_v1.zip`.
 
-#### Section 3 — Model Training Setup
-| Sub-section | What it does |
-|-------------|--------------|
-| **3.1 Deep Learning Environment** | Installs PyTorch (CUDA 11.8), `segmentation-models-pytorch`, `albumentations`, `timm`, TensorBoard |
-| **3.2 Model Configuration** | Selects architecture (`DeepLabv3+` or `PSPNet`), backbone (`resnet18`–`resnet152`), and hyperparameters (batch size, LR, epochs, image size) |
-| **3.3 Class Labels & Label Map** | Parses `labelmap.txt` (supports `ClassName:R,G,B` format), builds RGB→class-index mapping, auto-detects whether masks are RGB or grayscale |
-| **3.4 Data Transforms & Dataset** | Custom `RGBSegmentationDataset` with vectorized 256³ LUT for RGB→index conversion (~10-50× faster than per-pixel loops); Albumentations augmentations (flips, rotations, brightness, noise); separate train/val transforms |
-| **3.5 Model Initialization** | Instantiates the model with ImageNet-pretrained encoder, DiceLoss, Adam optimizer, ReduceLROnPlateau scheduler |
-| **3.6 Forward Pass Test** | Validates the full pipeline (input → model → output) with `model.eval()` to avoid BatchNorm issues on single-sample batches |
+**Cómo se obtiene (`segpipe.data_io.ensure_dataset`)**, en este orden:
+1. Copia ya descomprimida y validada en `/content/data/segpack_v1`.
+2. Colab: descarga por file ID **con tu cuenta** (`google.colab.auth.authenticate_user` + Drive API `files().get_media` por rangos de 32 MB, reanudable, con barra de progreso). Funciona con el archivo privado y no depende de gdown ni de enlaces públicos.
+3. Drive montado en `/content/drive` (ruta configurable `archive.drive_mounted_path`). El zip se copia al disco local.
+4. Local (solo pruebas): `SEGPACK_DIR` (carpeta descomprimida; se verifican los sha256 de las imágenes) o `SEGPACK_ZIP`.
 
-#### Section 4 — Training Loop & Visualization
-- Epoch-level training with `tqdm` progress bars.
-- Tracks **DiceLoss** and **per-class mean IoU (mIoU)** per epoch for accurate multi-class evaluation.
-- **Early stopping** halts training when validation mIoU stops improving for N epochs (`EARLY_STOPPING_PATIENCE`, default 10).
-- **Learning rate tracking** records actual LR per epoch for accurate schedule plots.
-- Saves the **best model** (by validation mIoU) and the **final model** as `.pth` checkpoints containing model weights, optimizer state, scheduler state, class names, and architecture metadata.
-- Generates a 4-panel matplotlib figure: Train/Val Loss, Train/Val mIoU, LR schedule history, and a text summary.
-
-#### Section 5 — Reusable Evaluation Metrics (Wilk et al. 2022–compatible)
-Provides benchmark-comparable evaluation using the four standard metrics from the semantic segmentation literature:
-
-| Metric | Description |
-|--------|-------------|
-| **mIoU** | Mean Intersection over Union across all classes |
-| **OA** | Overall pixel-level accuracy |
-| **mAcc** | Mean per-class accuracy (recall) |
-| **mF1** | Mean per-class F1-score |
-
-Key components:
-- `SegmentationMetrics` class — confusion-matrix-based accumulator that derives all four metrics.
-- `evaluate_model()` — runs the trained model on a DataLoader and returns full metrics.
-- `plot_training_curves()` — 4-panel figure with corrected LR tracking.
-- `plot_confusion_matrix()` — normalized heatmap per class.
-- `plot_wilk_comparison()` — grouped bar chart comparing results against Wilk et al. (2022).
-- CSV export of per-class metrics and experiment summaries.
-
-#### Section 6 — Post-Training Evaluation & Benchmark Comparison
-Runs the full evaluation pipeline after training:
-1. Loads the best checkpoint and evaluates on the validation set.
-2. Prints and exports per-class metrics to `logs/metrics_per_class.csv`.
-3. Exports a one-row experiment summary to `logs/metrics_summary.csv` (appends across runs).
-4. Plots confusion matrix and Wilk et al. comparison chart.
-5. Prints a delta table showing how our results compare to the published benchmarks.
+Siempre se verifica el tamaño y el sha256 del zip, se descomprime al disco local de la VM y se valida contra `manifest.csv` (parejas completas, tamaños de imagen y máscara, archivos sobrantes). Durante el entrenamiento nunca se lee de Drive.
 
 ---
 
-## Core Concepts
+## Protocolo de evaluación (siempre activo)
 
-### Semantic Segmentation
-Assigns a class label to **every pixel** in an image (e.g., "road", "building", "vegetation"). Unlike object detection (bounding boxes) or instance segmentation (per-object masks), semantic segmentation produces a single dense label map.
-
-### Architectures Used
-- **DeepLabv3+** — Uses atrous (dilated) convolutions and an encoder-decoder structure with Atrous Spatial Pyramid Pooling (ASPP) for multi-scale context.
-- **PSPNet** (Pyramid Scene Parsing Network) — Applies a Pyramid Pooling Module to aggregate context at multiple scales before final classification.
-- Both use a **ResNet** backbone (pre-trained on ImageNet) as the feature extractor.
-
-### Loss Function — DiceLoss
-Measures the overlap between predicted and ground-truth masks. Defined as $1 - \frac{2|P \cap G|}{|P| + |G|}$. Works well for class-imbalanced segmentation tasks.
-
-### IoU (Intersection over Union)
-The primary evaluation metric: $\text{IoU} = \frac{|P \cap G|}{|P \cup G|}$. Ranges from 0 (no overlap) to 1 (perfect overlap). Values above **0.7** generally indicate good segmentation quality.
-
-### Benchmark Reference — Wilk et al. (2022)
-Results are compared against the metrics reported in:
-> Wilk, Ł. et al. (2022). "Automatic classification of roof types from 3D building models using semantic segmentation." *ISPRS Archives*, XLIII-B2-2022, 485–492.
-
-| Metric | Wilk (image) | Wilk (texture voting) |
-|--------|-------------:|----------------------:|
-| mIoU   | 60.3%        | 63.8%                 |
-| OA     | 84.1%        | 89.9%                 |
-| mAcc   | 81.4%        | 89.8%                 |
-| mF1    | 72.0%        | 73.5%                 |
-
-### Data Pipeline
-```
-Azure Blob Storage
-  ├── drone-imagery/              (source images)
-  ├── pascual_annotation_masks/
-  │     ├── SegmentationClass/    (CVAT-exported RGB masks)
-  │     └── labelmap.txt          (class name → RGB mapping)
-  └──────────────────────────────────────
-          │  download_blobs()
-          ▼
-  Local: assets/images/   assets/masks/   assets/labelmap.txt
-          │
-          ▼
-  RGBSegmentationDataset  →  Albumentations  →  DataLoader  →  Model
-```
-
-### RGB Mask Handling
-CVAT exports masks where each class is encoded as a distinct RGB color. The notebook:
-1. Parses `labelmap.txt` to extract `ClassName:R,G,B` entries.
-2. Converts RGB triplets to BGR (OpenCV convention) for lookup.
-3. Pre-builds a flat 256³ NumPy lookup table for O(1) vectorized per-pixel conversion.
-4. Falls back to vectorized nearest-color matching when exact pixel colors aren't found in the map.
+- **Split espacial por bloques ("fuga reducida").** Cada foto se representa por su **huella en tierra**, no por la posición del dron. Con la calibración de Metashape (f = 6.72 mm, píxel = 0.0026188 mm, 4032×2268 → FOV 76.3° × 47.7°), las 4 esquinas de la imagen se proyectan a un plano a `RelativeAltitude` bajo el dron, orientando la cámara con el yaw/pitch/roll del gimbal. Supuestos: terreno plano, punto principal centrado, sin distorsión. Con pitch −45° y 58.7 m, la huella va de 23 a 152 m delante del dron y mide ~91 m de ancho en el borde cercano y ~238 m en el lejano. El **centro** de la foto es el centroide del polígono (≈ 96 m del dron).
+  - Los centros se agrupan en una grilla de **150 m**. La fecha de vuelo no interviene: 9 de los 19 bloques mezclan fotos de los dos vuelos. Los bloques completos se reparten en **k = 5 pliegues**, balanceando el nº de fotos y la presencia de clases raras. En el pliegue *f*: test = *f*, val = *f*+1, train = el resto **menos las fotos a < 50 m** (buffer, entre centros) de cualquier foto de val o test.
+  - Con el pack real (buffer 50 m) quedan 33–39 fotos de train, 12–15 de val y 12–15 de test por pliegue, y se excluyen 2–7 por el buffer. La distancia mínima entre centros train↔test va de 54 a 66 m.
+  - **Fuga reducida, no eliminada:** las huellas de train todavía cubren el **38–60 %** del área de las huellas de test. Con buffer de 75 m (corrida de sensibilidad J0-b75) baja a 32–46 %, con 23–32 fotos de train. Un buffer entre centros no puede eliminar el solape de huellas de ~150 × 90–240 m sin dejar el train casi vacío. El reporte del split da, por pliegue, la distancia mínima train↔test y el % de solape residual train→test y train→val (rasterizado a 2 m).
+  - Con 66 fotos un split fijo es frágil. Por eso el protocolo del artículo es **CV por bloques**: al juntar el test de todos los pliegues, cada foto se evalúa exactamente una vez y todas las clases tienen ≥ 12 fotos de test. `PROTOCOL="fixed"` usa solo el pliegue 0.
+  - Las listas de cada partición se guardan en `STUDY_DIR/splits/` (`splits.json`, `fold<k>.csv`, `split_report.txt`; `splits/buffer75/` para J0-b75, con la misma asignación de bloques).
+- **Métricas** desde matrices de confusión por foto a **resolución nativa**: mIoU, OA, mAcc, mF1 y métricas por clase (IoU, recall, precisión, F1). Una clase presente en < **K = 5** fotos de la partición evaluada se marca **"no evaluable"** y se excluye de mIoU/mAcc/mF1, y queda explícito en la salida. **IC 95 % por bootstrap remuestreando fotos** (2000 réplicas). Salida JSON + CSV por corrida.
+- La selección del checkpoint y el early stopping usan solo val. Test se evalúa una vez, con `best.pt`.
 
 ---
 
-## Prerequisites
+## Escalera de ablación
 
-| Requirement | Details |
-|-------------|---------|
-| **Runtime** | Google Colab with GPU (CUDA 11.8 recommended) |
-| **Azure** | A Blob Storage account with a `general-purpose` container containing the imagery and CVAT masks |
-| **Secret** | `AZURE_CONNECTION_STRING` stored as a Colab user secret |
-| **Annotation Tool** | CVAT with PASCAL VOC / Segmentation Mask export |
+Cada paso cambia una sola cosa respecto al anterior (`segpipe.runner.describe_ladder()` imprime el diff exacto de las configs).
 
-## Quick Start
+| Config | Cambio | Detalle |
+|---|---|---|
+| **J0** | receta original | DeepLabv3+ ResNet-50 (smp), Resize 512×512, aumentos originales (flips, rot90, ShiftScaleRotate, color, ruido/blur, CoarseDropout 8×16 px), Dice + CE ponderada (1/frecuencia, media 1), Adam lr 1e-4 wd 1e-4, ReduceLROnPlateau (×0.5, paciencia 5), batch 8, 50 épocas, early stopping 10 sobre mIoU de val. Predice a 512 y reescala los logits a 4032×2268. |
+| **J1** | resolución | Recortes aleatorios de **1024 px nativos** (880 por época) e inferencia por **ventana deslizante** 1024 con 50 % de solape. Hipótesis a medir: el resize (~3–4.5 → ~20–25 cm/px) borra clases delgadas (Fence, Lightning Posts). |
+| **J2** | clases raras | Con p = 0.5 el recorte se centra en un píxel de una clase rara (< 1 % de los píxeles de train). La pérdida no cambia. Alternativa de pérdida opcional: `J2-loss` (Dice + focal, sin pesos). |
+| **J3** | modelo | SegFormer **mit-b3** (`nvidia/mit-b3`, transformers); el resto es idéntico a J2. |
+| **M-b3** | aparte | Receta de Mauricio (aprox.) sobre nuestro dataset y protocolo; ver [docs/mauricio_config.md](docs/mauricio_config.md) para lo tomado de su hoja Config y lo supuesto. |
 
-1. Open either notebook in Google Colab using the badge links above.
-2. Set your `AZURE_CONNECTION_STRING` in Colab Secrets.
-3. Run all cells sequentially from top to bottom.
-4. For the training notebook, monitor the Loss/IoU plots to check for overfitting.
-5. Download the saved `.pth` model checkpoint from `models/`.
+Controles fuera de la escalera (en la cola por defecto):
 
-## Dependencies
+| Config | Para qué | Detalle |
+|---|---|---|
+| **J0-pasos** | confusor de J1 (resolución + nº de pasos) | J0 con 880 muestras/época (fotos repetidas en ciclo, cada una con su aumento) → mismo presupuesto máximo de pasos que J1 (50 × 110 = 5500). **J0-pasos → J1** aísla el efecto de la resolución. Los pasos de optimización realizados (total y al mejor checkpoint) quedan en `epoch_log.csv`, `DONE.json` y la tabla final. |
+| **J0-b75** | sensibilidad a la fuga | J0 con buffer de 75 m: misma asignación de bloques, por lo tanto mismos val y test, y menos train. |
 
-See [requirements.txt](requirements.txt) for the full list. Key packages:
+También quedan registrados **PSPNet** y **UNet++** (`configs/runs/PSPNet.yaml`, `UNetPP.yaml`: J2 con otro modelo) y `J2-loss`, fuera de la cola por defecto.
 
+---
+
+## Cómo correr en Colab
+
+### Desde el navegador
+
+1. Abre `notebooks/train_ablation.ipynb` con el badge de Colab (o *Archivo → Abrir cuaderno → GitHub*). Elige GPU (A100 o L4).
+2. **Sección 1:** clona el repo en `/content/sam-image-processing` e instala solo los paquetes que falten. Se usa el torch que trae Colab, sin reinstalarlo ni fijar `cu118`.
+3. **Sección 2:** monta Drive y define `STUDY_DIR` (en Drive), `PROTOCOL`, `CONFIGS` y `SEEDS` (por defecto una sola, 42; `EXTRA_SEEDS` añade más).
+4. **Sección 3:** obtiene y valida el dataset (pide autorizar tu cuenta la primera vez), construye o reutiliza el split y reporta los píxeles ignorados.
+5. **Sección 4 (primero, siempre):** corrida de humo de J0, J3, J1, J2 y M-b3, con interrupción y reanudación; luego **tiempo medido por época** y **estimación de horas de GPU** de la cola completa. Ver [docs/smoke_run.md](docs/smoke_run.md).
+6. **Sección 5:** cola de corridas, solo después de revisar la estimación. **Si la sesión se corta, vuelve a ejecutar las secciones 1–3 y la misma celda de la sección 5**: cada corrida continúa desde su último `last.pt` y las terminadas se saltan.
+7. **Sección 6:** tabla comparativa para el artículo.
+
+### Desde VS Code
+
+Con la extensión de Colab para VS Code (*Select Kernel → Colab → New Colab Server*, eligiendo GPU), abre el mismo notebook; el kernel corre en la VM de Google, no en tu PC. Las secciones son las mismas. **No probado:** si `authenticate_user()` o `drive.mount()` no funcionan en la extensión, `ensure_dataset` pasa a la siguiente fuente. Como último recurso, sube el zip a la VM y define `os.environ["SEGPACK_ZIP"] = "/content/segpack_v1.zip"`. Los checkpoints necesitan una ruta en Drive montado para sobrevivir a la sesión.
+
+### Recursos y tiempo
+
+Cola por defecto, en orden: **J0 → J3 → J1 → J2 → M-b3 → J0-pasos → J0-b75**. Cada config completa (todos sus pliegues) antes de la siguiente, con 1 semilla: 7 configs × 1 semilla × 5 pliegues = **35 corridas**, más 5 corridas cortas de humo en un estudio aparte. Cada semilla extra suma 35.
+
+GPU, micro-lote y workers se detectan automáticamente. El batch efectivo de cada config se mantiene con acumulación de gradiente si no cabe en la GPU. Se usa AMP (bf16 si la GPU lo soporta; si no, fp16 con GradScaler). Puedes forzar el micro-lote con `train.micro_batch` en el YAML. Usa `MAX_RUNS` para limitar las corridas de cada sesión.
+
+---
+
+## Cómo reproducir J0–J3
+
+```python
+from segpipe.runner import prepare_study, run_queue
+from segpipe import report
+study = prepare_study("/content/drive/MyDrive/segpipe/pascual_v1", "configs/datasets/pascual.yaml",
+                      protocol="cv", k=5, block_m=150, buffer_m=50, split_seed=0)
+CONFIGS = ["J0", "J3", "J1", "J2", "M-b3", "J0-pasos", "J0-b75"]
+run_queue(study, CONFIGS, seeds=[42])          # semillas extra: seeds=[42, 43, 44]
+res = report.build("/content/drive/MyDrive/segpipe/pascual_v1", CONFIGS)
 ```
-azure-storage-blob >= 12.17.0
-opencv-python      >= 4.8.0
-pillow             >= 10.0.0
-numpy              >= 1.24.0
-matplotlib         >= 3.7.0
-torch + torchvision (CUDA 11.8)
-segmentation-models-pytorch >= 0.3.3
-albumentations     >= 1.3.0
-timm               >= 0.9.0
-scikit-learn       >= 1.3.0
-tqdm               >= 4.65.0
-tensorboard        >= 2.13.0
+
+Cada corrida (`STUDY_DIR/runs/<config>/seed<s>/fold<f>/`) guarda: `config.json` (config resuelta), `split.json`, `env.json` (GPU, versiones de librerías, commit de git y estado *dirty*, una entrada por sesión), `epoch_log.csv` (pérdida, mIoU/min-IoU/OA de val, IoU por clase, lr, segundos totales/train/val, muestras, pasos de optimización acumulados), `best.pt`, `val/` y `test/` (`metrics.json`, `metrics_per_class.csv`, `photo_confusion.npz`) y `DONE.json`. `last.pt` (modelo, optimizador, scheduler, scaler, época, mejor métrica, paciencia, historial y estado RNG) se reescribe de forma atómica en cada época y se borra al terminar.
+
+`STUDY_DIR/results/` contiene `comparison.md` (tablas listas para el artículo), `summary.csv`, `per_class.csv`, `deltas.csv` y `comparison.json`: media ± DE entre semillas, IC 95 % por bootstrap de fotos para la media entre semillas, IoU por clase, pasos de optimización (total / al mejor checkpoint), buffer y solape residual train→test, y diferencias pareadas de mIoU: J0→J1→J2→J3, cada control vs J0, **J0-pasos → J1** y J3 → M-b3.
+
+Para cambiar algo, crea un YAML nuevo con `base: J2.yaml` y solo los campos que cambian. Un `run_dir` existente rechaza una config distinta, así que no se mezclan resultados.
+
+---
+
+## Añadir otro dataset (p. ej. el de Mauricio): pipeline configurable por esquema de clases
+
+1. Empaquétalo en el mismo formato con `tools/pack_dataset.py` (`images/`, `masks/`, `classes.json`, `manifest.csv` con las columnas de GPS y gimbal, `class_stats.csv`). Súbelo a Drive.
+2. Copia `configs/datasets/pascual.yaml` a, por ejemplo, `configs/datasets/mauricio.yaml` y cambia `name`, `version`, `archive` (`filename`, `size_bytes`, `sha256`, `drive_file_id`) y `local.extract_dir`.
+3. Esquema de clases, sección `classes:`:
+   - `ignore:` clases que se ignoran (p. ej. `[sin_clase]` si significa "sin anotar").
+   - Opcional, **mapeo fino → grueso hacia un esquema común**: `target:` (lista ordenada de clases comunes) y `mapping:` (clase fina → clase común). Toda clase no ignorada debe estar mapeada; si falta alguna, el pipeline falla con un mensaje claro. Ejemplo **ilustrativo** (el esquema común hay que acordarlo):
+
+     ```yaml
+     classes:
+       ignore: [background]
+       target: [edificacion, superficie_pavimentada, suelo, vegetacion, agua, vehiculo, otros_objetos]
+       mapping:
+         Buildings: edificacion
+         Road Surface: superficie_pavimentada
+         Paved Surface: superficie_pavimentada
+         Parkinglots: superficie_pavimentada
+         Ground Surface: suelo
+         Brownfields: suelo
+         Sports Fields: vegetacion
+         Vegetation: vegetacion
+         Pools: agua
+         Vehicle: vehiculo
+         Fence: otros_objetos
+         Lightning Posts: otros_objetos
+     ```
+
+     El YAML de Mauricio llevaría su propio `mapping` (p. ej. `via_pavimentada → superficie_pavimentada`, `vegetacion_alta`/`vegetacion_baja → vegetacion`), con el mismo `target`, para comparar ambos datasets en el esquema común.
+4. Usa un `STUDY_DIR` distinto y `prepare_study(STUDY_DIR, "configs/datasets/mauricio.yaml", …)`. Las mismas configs J0–J3/M-b3 sirven: el número de clases sale del esquema.
+
+Hoy el mapeo se aplica a las etiquetas antes de entrenar (el modelo aprende el esquema común). **Pendiente (después del humo):** evaluar un modelo de 12 clases en el esquema común sumando filas y columnas de su matriz de confusión fino→grueso. Las matrices por foto ya se guardan (`photo_confusion.npz`), así que no hará falta reentrenar.
+
+---
+
+## Pruebas locales (CPU)
+
+```bash
+python -m venv .venv && .venv/Scripts/activate          # Windows; en Linux: source .venv/bin/activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+pytest
 ```
 
-## License
+Las pruebas usan datos sintéticos pequeños y cubren: lectura de `classes.json`, RGB → índice (con fallo ante colores desconocidos), mapeo fino → grueso, split por bloques (ninguna foto de train dentro del buffer), métricas contra un caso calculado a mano, bootstrap, clase "no evaluable", descarga por rangos con reanudación (Drive API simulada), validación del pack, reanudación desde checkpoint (misma métrica tras interrumpir), forward/backward de DeepLabv3+ y SegFormer mit-b3, y un flujo de punta a punta estudio → cola → tabla. Para usar el pack real en local: `SEGPACK_ZIP=/ruta/segpack_v1.zip` (se descomprime en `.data/`, ignorado por git).
 
-See individual notebook headers for attribution. SAM 2 components are adapted from [facebookresearch/segment-anything](https://github.com/facebookresearch/segment-anything) under their original license.
+---
+
+## SAM 2: pre-anotación (`automatic_mask_generator_example.ipynb`)
+
+Genera máscaras zero-shot con `SAM2AutomaticMaskGenerator` sobre las fotos del pack (obtenidas con `ensure_dataset`) y exporta un único `annotations.json` COCO para importarlo en CVAT. Los resultados se escriben en disco local y, opcionalmente, se copian a una carpeta de Drive montado (`RESULTS_DRIVE_DIR`).
+
+## Referencia de comparación
+
+Wilk, Ł. et al. (2022). "Automatic classification of roof types from 3D building models using semantic segmentation." *ISPRS Archives*, XLIII-B2-2022, 485–492. Reportan mIoU 60.3 %, OA 84.1 %, mAcc 81.4 %, mF1 72.0 % (imagen). La comparación es solo orientativa: dataset, clases y protocolo son distintos.
+
+## Licencia
+
+Los componentes de SAM 2 están adaptados de [facebookresearch/segment-anything](https://github.com/facebookresearch/segment-anything) bajo su licencia original.

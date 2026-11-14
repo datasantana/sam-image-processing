@@ -1,0 +1,6 @@
+# Sensibilidad al buffer: J0 con buffer de 75 m (el estudio usa 50 m).
+# Misma asignación de bloques a pliegues (mismos val y test); solo se excluyen más fotos de train.
+base: J0.yaml
+description: "J0 con buffer espacial de 75 m (sensibilidad de la fuga reducida)"
+split:
+  buffer_m: 75

@@ -1,0 +1,4 @@
+# Opción registrada (fuera de la escalera por defecto): J2 con UNet++ ResNet-50.
+base: J2.yaml
+description: "J2 con UNet++ R50"
+model: {arch: unetplusplus, encoder: resnet50, weights: imagenet}
