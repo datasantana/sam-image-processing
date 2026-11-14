@@ -70,3 +70,7 @@ def test_smoke_then_cost_estimate(pack, tmp_path):
     assert cost["by_config"]["J0-pasos"]["proxy"] == "J0" and cost["by_config"]["J0-b75"]["proxy"] == "J0"
     lo, hi = cost["total_h"]
     assert 0 < lo <= hi
+    # J2 (mismo coste por muestra que J1) se estima con J1; M-b3 sin humo propio no se estima con nadie
+    assert estimate_cost(smoke, study, ["J2"], seeds=[42], log=lambda *a: None)["by_config"]["J2"]["proxy"] == "J1"
+    with pytest.raises(RuntimeError, match="M-b3"):
+        estimate_cost(smoke, study, ["M-b3"], seeds=[42], log=lambda *a: None)

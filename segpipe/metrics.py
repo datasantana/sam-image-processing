@@ -91,7 +91,10 @@ def bootstrap(photo_cms: np.ndarray, evaluable: np.ndarray, n_boot: int = 2000, 
             stats[k][b] = s[k]
         cls_iou[b] = per_class(cm)["iou"]
     lo, hi = 100 * alpha / 2, 100 * (1 - alpha / 2)
-    out = {k: [float(np.nanpercentile(v, lo)), float(np.nanpercentile(v, hi))] for k, v in stats.items()}
+
+    def pct(v, q):
+        return float(np.nanpercentile(v, q)) if np.isfinite(v).any() else float("nan")
+    out = {k: [pct(v, lo), pct(v, hi)] for k, v in stats.items()}
     with np.errstate(all="ignore"):
         out["class_iou"] = [[float(np.nanpercentile(cls_iou[:, c], lo)) if np.isfinite(cls_iou[:, c]).any() else None,
                              float(np.nanpercentile(cls_iou[:, c], hi)) if np.isfinite(cls_iou[:, c]).any() else None]

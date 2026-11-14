@@ -224,7 +224,8 @@ def run_queue(study: Study, configs: Iterable[str] = DEFAULT_QUEUE, seeds: Itera
 
 # ----------------------------------------------------------------------------- humo y costo
 
-SMOKE_OVERRIDES = {"train": {"epochs": 2}, "data": {"samples_per_epoch": 32}, "eval": {"n_boot": 200}}
+# min_photos 1: con 2-3 fotos de val/test y K=5 todas las clases serían "no evaluables" (mIoU NaN)
+SMOKE_OVERRIDES = {"train": {"epochs": 2}, "data": {"samples_per_epoch": 32}, "eval": {"n_boot": 200, "min_photos": 1}}
 SMOKE_SUBSET = {"train": 6, "val": 2, "test": 3}
 
 
@@ -244,20 +245,26 @@ def run_smoke(smoke: Study, configs: Iterable[str] = SMOKE_CONFIGS, seed: int = 
     return out
 
 
+def _cost_signature(cfg: dict) -> tuple:
+    """Lo que determina el coste por muestra de train y por foto de val."""
+    d, i = cfg["data"], cfg["infer"]
+    return (json.dumps(cfg["model"], sort_keys=True), d["mode"],
+            d["resize"] if d["mode"] == "resize" else d["crop"], json.dumps(d.get("scale_range")),
+            json.dumps(i, sort_keys=True), cfg["train"]["batch"], cfg["train"].get("micro_batch"))
+
+
 def _proxy_log(smoke_dir: Path, cfg: dict, seed: int, fold: int) -> Optional[tuple[str, dict]]:
-    """Última fila del epoch_log del humo para la config o, si no se corrió, para su base."""
-    name, base = cfg["name"], cfg.get("base")
-    seen = set()
-    while name and name not in seen:
-        seen.add(name)
-        p = smoke_dir / "runs" / name / f"seed{seed}" / f"fold{fold}" / "epoch_log.csv"
-        if p.exists():
+    """Última fila del epoch_log del humo para la config o, si no se corrió, para la primera config
+    de su cadena de bases con el mismo coste por muestra (mismo modelo, modo, tamaño e inferencia)."""
+    sig = _cost_signature(cfg)
+    c, seen = cfg, set()
+    while c is not None and c["name"] not in seen:
+        seen.add(c["name"])
+        p = smoke_dir / "runs" / c["name"] / f"seed{seed}" / f"fold{fold}" / "epoch_log.csv"
+        if p.exists() and _cost_signature(c) == sig:
             rows = list(csv.DictReader(open(p, encoding="utf-8")))
-            return name, rows[-1]
-        if not base:
-            break
-        c = load_run_config(_resolve(f"configs/runs/{base}"))
-        name, base = c["name"], c.get("base")
+            return c["name"], rows[-1]
+        c = load_run_config(_resolve(f"configs/runs/{c['base']}")) if c.get("base") else None
     return None
 
 
@@ -278,7 +285,8 @@ def estimate_cost(smoke: Study, study: Study, configs: Iterable[str] = DEFAULT_Q
             continue
         px = _proxy_log(smoke.dir, cfg, smoke_seed, sm_fold)
         if px is None:
-            raise RuntimeError(f"No hay humo para {name} ni para su base; corre run_smoke primero")
+            raise RuntimeError(f"No hay humo para {name} ni para una base con el mismo coste por muestra; "
+                               "corre run_smoke con esa config")
         proxy, r = px
         sps = float(r["train_seconds"]) / max(1, float(r["n_train_samples"]))
         spv = float(r["val_seconds"]) / max(1, float(r["n_val"]))
@@ -297,7 +305,7 @@ def estimate_cost(smoke: Study, study: Study, configs: Iterable[str] = DEFAULT_Q
         d = by_cfg.setdefault(r["config"], {"proxy": r["proxy"], "epoch_s": [], "h_min": 0.0, "h_max": 0.0, "runs": 0})
         d["epoch_s"].append(r["epoch_s"]); d["h_min"] += r["h_min"]; d["h_max"] += r["h_max"]; d["runs"] += len(seeds)
     lines = [f"Estimación con {len(seeds)} semilla(s); tiempos medidos en el humo (misma GPU):",
-             "| Config | Medido en | s/época (media pliegues) | Corridas | Horas GPU (mín–máx) |", "|---|---|---|---|---|"]
+             "| Config | Medido en | s/época (media pliegues) | Corridas | Horas en el dispositivo del humo (mín–máx) |", "|---|---|---|---|---|"]
     for c, d in by_cfg.items():
         lines.append(f"| {c} | {d['proxy']} | {sum(d['epoch_s']) / len(d['epoch_s']):.0f} | {d['runs']} | "
                      f"{d['h_min']:.1f}–{d['h_max']:.1f} |")
@@ -322,7 +330,7 @@ def smoke_epoch_times(smoke: Study, configs: Iterable[str] = SMOKE_CONFIGS, seed
             continue
         r = list(csv.DictReader(open(p, encoding="utf-8")))[-1]
         env = json.loads((d / "env.json").read_text(encoding="utf-8"))["sessions"][-1]
-        lines.append(f"| {c} | {env['gpu'].get('name')} | {env['micro_batch']} × {env['accum_steps']} | "
+        lines.append(f"| {c} | {env['gpu'].get('name') or 'CPU'} | {env['micro_batch']} × {env['accum_steps']} | "
                      f"{float(r['train_seconds']) / max(1, float(r['n_train_samples'])):.3f} | "
                      f"{float(r['val_seconds']) / max(1, float(r['n_val'])):.2f} | {float(r['seconds']):.0f} |")
     return "\n".join(lines)

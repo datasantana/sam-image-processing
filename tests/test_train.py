@@ -140,3 +140,35 @@ def test_step_budget_is_logged_and_j0_pasos_matches_j1(store, tmp_path):
     for col in ("opt_steps", "train_seconds", "val_seconds", "n_train_samples", "n_val"):
         assert col in head
     assert log[-1].split(",")[head.index("n_train_samples")] == "16"
+
+
+def test_mb3_recipe_runs_and_selects_by_maxmin(store, tmp_path):
+    # SegFormer pequeño (arquitectura mit-b0, sin descargar pesos) con la receta M-b3 completa:
+    # escala aleatoria [0.5, 1], AdamW + poly, CE sin pesos, inferencia a escala 0.75, selección max-min.
+    cfg = tiny_cfg("M-b3", model={"hf_name": "nvidia/mit-b0", "weights": None},
+                   train={"epochs": 2, "patience": 15})
+    assert cfg["data"]["scale_range"] == [0.5, 1.0] and cfg["infer"]["scale"] == 0.75
+    assert cfg["train"]["select"] == "maxmin" and cfg["sched"]["name"] == "poly"
+    r = train_run(cfg, store, split_of(store), tmp_path / "a" / "b" / "m", 42, log=lambda *a: None)
+    assert r["select"] == "maxmin" and r["optimizer_steps_total"] == 2 * 2
+    import csv
+    rows = list(csv.DictReader(open(tmp_path / "a" / "b" / "m" / "epoch_log.csv", encoding="utf-8")))
+    best = max(float(x["val_min_iou"]) for x in rows)
+    assert r["select_value"] == pytest.approx(best)
+    lrs = [float(x["lr"]) for x in rows]
+    assert lrs[1] < lrs[0]  # poly decae por iteración
+
+
+def test_scale_range_crops_cover_larger_native_area(store):
+    cfg = tiny_cfg("M-b3")
+    names = split_of(store)["train"]
+    ds, _ = build_train_dataset(store, names, {**cfg["data"], "augment": "none"}, 0, store.schema.names)
+    import numpy as np
+    sides = []
+    orig = ds._scaled_crop
+    ds._scaled_crop = lambda img, mask, cy, cx, side, rng: (sides.append(side), orig(img, mask, cy, cx, side, rng))[1]
+    for i in range(40):
+        x, y = ds[i]
+        assert x.shape == (3, 32, 32)
+    s = np.array(sides) / 32  # side nativo = crop / escala → escala = 32 / side
+    assert (s >= 1.0 - 1e-9).all() and (s <= 2.0 + 1e-9).all() and s.std() > 0.1

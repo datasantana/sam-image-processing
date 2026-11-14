@@ -22,16 +22,18 @@ Al terminar, borra la carpeta `…_smoke` de Drive si quieres. La estimación le
 
 ## Qué se verificó localmente (CPU, sin GPU)
 
-- `pytest`: 40 pruebas, entre ellas:
+- `pytest`: 42 pruebas, entre ellas:
   - reanudación con métricas, log y pesos idénticos a una corrida sin interrumpir (J0 y J1);
   - geometría de la huella con el FOV real;
   - solape rasterizado;
   - variante de buffer con los mismos val/test;
   - bloques que ignoran la fecha de vuelo;
   - mismo presupuesto de pasos en J0-pasos y J1;
+  - receta M-b3 completa (escala aleatoria continua [0.5, 1], AdamW + poly, inferencia a 0.75, selección max-min);
   - humo → estimación de costo, y estudio → cola → tabla con datos sintéticos.
 - Con el zip real (copia local, `SEGPACK_ZIP`): sha256, descompresión, validación (66 parejas), split con huellas de cámara, solape residual por pliegue (buffer 50 y 75 m) y mezcla de vuelos por bloque.
-- Una versión reducida del humo con las fotos reales en CPU (J1, DeepLabv3+ R18, recortes y ventana de 512): interrupción, reanudación y métricas. Se hizo antes del cambio de huellas; el flujo de entrenamiento no cambió.
+- `run_smoke` con las fotos reales en CPU para **J0 y J3**, con pesos preentrenados reales (ResNet-50 ImageNet y `nvidia/mit-b3` desde Hugging Face), 3/1/1 fotos y 8 muestras/época: interrupción tras la época 1, reanudación, evaluación final y pasos registrados. Con esos logs, `smoke_epoch_times` y `estimate_cost` funcionaron con los pliegues reales; la estimación se niega a usar J0 como sustituto de J1, que tiene otro coste por muestra. Los tiempos de CPU (≈ 12 min/época para J3) no sirven para estimar Colab. J1, J2 y M-b3 no se corrieron con datos reales en CPU (> 1 h); están cubiertos por las pruebas sintéticas.
+- Antes del cambio de huellas: humo reducido de J1 con fotos reales en CPU (interrupción, reanudación, métricas).
 
 ## Qué NO se pudo verificar sin Colab
 
