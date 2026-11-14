@@ -1,31 +1,30 @@
-# sam-image-processing — Python dependencies
-# Install with: pip install -r requirements.txt
-# For GPU support, install PyTorch separately first:
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# sam-image-processing / segpipe — dependencias mínimas
+#
+# PyTorch NO se fija aquí: en Colab se usa el torch (CUDA) que ya trae la imagen.
+# En local (solo pruebas en CPU): pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# Instalar: pip install -r requirements.txt
 
-# Azure storage
-azure-storage-blob>=12.17.0
+# Datos e imagen
+numpy>=1.24
+pandas>=2.0
+pillow>=10.0
+opencv-python-headless>=4.8
+pyyaml>=6.0
+tqdm>=4.65
 
-# Image processing
-opencv-python>=4.8.0
-pillow>=10.0.0
-
-# Numerical / scientific
-numpy>=1.24.0
-pandas>=2.0.0
-scikit-learn>=1.3.0
-
-# Deep learning
-torch>=2.0.0
-torchvision>=0.15.0
-torchaudio>=2.0.0
+# Modelos y aumentos
 segmentation-models-pytorch>=0.3.3
-timm>=0.9.0
+transformers>=4.40      # SegFormer (nvidia/mit-b3)
+timm>=0.9
+albumentations>=1.4
 
-# Data augmentation
-albumentations>=1.3.0
+# Descarga desde Google Drive (ya incluidos en Colab)
+google-api-python-client>=2.0
+google-auth>=2.0
 
-# Visualization & monitoring
-matplotlib>=3.7.0
-tqdm>=4.65.0
-tensorboard>=2.13.0
+# Gráficas
+matplotlib>=3.7
+
+# Pruebas
+pytest>=7.0

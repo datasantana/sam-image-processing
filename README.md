@@ -1,6 +1,8 @@
 # SAM Image Processing — Drone Imagery Semantic Segmentation
 
-End-to-end pipeline for **semantic segmentation** of drone imagery, combining Meta's Segment Anything Model (SAM 2) for automatic mask generation with supervised training of **DeepLabv3+** / **PSPNet** models on CVAT-annotated datasets stored in Azure Blob Storage.
+End-to-end pipeline for **semantic segmentation** of drone imagery, combining Meta's Segment Anything Model (SAM 2) for automatic mask generation with supervised training of **DeepLabv3+** / **PSPNet** models on CVAT-annotated datasets.
+
+> **Data source.** The dataset is distributed as a single verified archive (`segpack_v1.zip`) in Google Drive and fetched by `segpipe.data_io` (see [Dataset](#dataset)). Azure Blob Storage is no longer used.
 
 ---
 
@@ -26,11 +28,12 @@ Generates zero-shot segmentation masks using Meta's **SAM 2** (`SAM2AutomaticMas
 
 | Step | Description |
 |------|-------------|
-| **Environment setup** | Installs SAM 2, PyTorch (CUDA 11.8), pycocotools, Azure SDK |
+| **Environment setup** | Installs SAM 2 and pycocotools (uses Colab's preinstalled PyTorch) |
+| **Image source** | Fetches the segpack with `segpipe.data_io.ensure_dataset` to the VM's local disk |
 | **Grid-based prompting** | Samples single-point prompts across the image |
 | **Mask filtering** | Quality scoring + non-maximal suppression to deduplicate |
 | **COCO export** | Converts masks to COCO-format JSON for ingestion by CVAT |
-| **Azure integration** | Reads/writes imagery and annotations from Azure Blob Storage |
+| **Results** | Written to the local disk; optionally copied to a mounted Google Drive folder |
 
 **Use case:** Pre-annotate drone images before manual refinement in CVAT.
 
@@ -42,10 +45,8 @@ Generates zero-shot segmentation masks using Meta's **SAM 2** (`SAM2AutomaticMas
 
 Trains pixel-level classification models on CVAT-exported masks. The notebook is divided into four major sections:
 
-#### Section 1 — Azure Blob Connection & Download
-- Connects to Azure Blob Storage using a connection string (stored as a Colab secret).
-- Downloads drone images and their corresponding PASCAL-VOC-style annotation masks.
-- Downloads the `labelmap.txt` that maps class names to RGB colors.
+#### Section 1 — Data download
+- *Historical:* this notebook originally downloaded images, masks and `labelmap.txt` from an Azure Blob container that no longer exists. Data now comes from the segpack archive (see [Dataset](#dataset)).
 
 #### Section 2 — Dataset Preparation
 - Pairs images with masks by matching base filenames.
@@ -127,19 +128,20 @@ Results are compared against the metrics reported in:
 
 ### Data Pipeline
 ```
-Azure Blob Storage
-  ├── drone-imagery/              (source images)
-  ├── pascual_annotation_masks/
-  │     ├── SegmentationClass/    (CVAT-exported RGB masks)
-  │     └── labelmap.txt          (class name → RGB mapping)
-  └──────────────────────────────────────
-          │  download_blobs()
+Google Drive: segpack_v1.zip  (private; file ID in configs/datasets/pascual.yaml)
+          │  segpipe.data_io.ensure_dataset()
+          │  download with the user's account (Drive API) │ or mounted Drive │ or SEGPACK_ZIP/SEGPACK_DIR
+          │  verify size + sha256 → extract → validate against manifest.csv
           ▼
-  Local: assets/images/   assets/masks/   assets/labelmap.txt
+  VM local disk: /content/data/segpack_v1/{images,masks,classes.json,manifest.csv,...}
           │
           ▼
-  RGBSegmentationDataset  →  Albumentations  →  DataLoader  →  Model
+  Dataset  →  Albumentations  →  DataLoader  →  Model
 ```
+
+### Dataset
+
+`segpack_v1.zip` (560,108,771 bytes, sha256 `1ef52bcb…f41ab`) contains 66 oblique UAV photos (4032×2268) of the Pascual Guerrero stadium area, their CVAT RGB masks, `classes.json` (ordered list of `index`, `name`, `rgb`; source of truth for the class schema), `labelmap.txt`, `manifest.csv` (hashes, sizes, DJI GPS/gimbal metadata), `class_stats.csv` and `REPORT.txt`. It was built with [`tools/pack_dataset.py`](tools/pack_dataset.py). A manual backup copy exists on OneDrive (link kept by the author; not automated).
 
 ### RGB Mask Handling
 CVAT exports masks where each class is encoded as a distinct RGB color. The notebook:
@@ -154,37 +156,19 @@ CVAT exports masks where each class is encoded as a distinct RGB color. The note
 
 | Requirement | Details |
 |-------------|---------|
-| **Runtime** | Google Colab with GPU (CUDA 11.8 recommended) |
-| **Azure** | A Blob Storage account with a `general-purpose` container containing the imagery and CVAT masks |
-| **Secret** | `AZURE_CONNECTION_STRING` stored as a Colab user secret |
-| **Annotation Tool** | CVAT with PASCAL VOC / Segmentation Mask export |
+| **Runtime** | Google Colab with GPU (uses the PyTorch build preinstalled by Colab) |
+| **Data** | Read access to `segpack_v1.zip` in Google Drive with the Google account used in Colab |
+| **Annotation Tool** | CVAT with Segmentation Mask 1.1 export (only needed to rebuild the pack) |
 
 ## Quick Start
 
-1. Open either notebook in Google Colab using the badge links above.
-2. Set your `AZURE_CONNECTION_STRING` in Colab Secrets.
-3. Run all cells sequentially from top to bottom.
-4. For the training notebook, monitor the Loss/IoU plots to check for overfitting.
-5. Download the saved `.pth` model checkpoint from `models/`.
+1. Open the notebook in Google Colab using the badge links above.
+2. Clone this repo in the VM and run the dataset cell: it authenticates with your Google account and downloads/validates the pack.
+3. Run the remaining cells.
 
 ## Dependencies
 
-See [requirements.txt](requirements.txt) for the full list. Key packages:
-
-```
-azure-storage-blob >= 12.17.0
-opencv-python      >= 4.8.0
-pillow             >= 10.0.0
-numpy              >= 1.24.0
-matplotlib         >= 3.7.0
-torch + torchvision (CUDA 11.8)
-segmentation-models-pytorch >= 0.3.3
-albumentations     >= 1.3.0
-timm               >= 0.9.0
-scikit-learn       >= 1.3.0
-tqdm               >= 4.65.0
-tensorboard        >= 2.13.0
-```
+See [requirements.txt](requirements.txt) (minimum versions only; PyTorch is not pinned). Local CPU tests: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt && pytest`.
 
 ## License
 
