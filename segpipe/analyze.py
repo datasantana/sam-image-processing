@@ -389,11 +389,49 @@ def load_mapping(path: Path) -> dict:
         if k not in m:
             raise ValueError(f"{path}: falta '{k}'")
     common = list(m["common"])
+    m["unmapped_prediction"] = _policies(m.get("unmapped_prediction", "error"))
     for side in ("mine", "mauricio"):
         bad = {f: t for f, t in m[side].items() if t is not None and t not in common}
         if bad:
             raise ValueError(f"{path}: destinos que no están en 'common' ({side}): {bad}")
+    for v in m.get("variants") or []:
+        if "name" not in v:
+            raise ValueError(f"{path}: variante sin 'name'")
+        for side in ("mine", "mauricio"):
+            for f, t in (v.get(side) or {}).items():
+                if f not in m[side]:
+                    raise ValueError(f"{path}: variante {v['name']}: clase desconocida {f!r} ({side})")
+                if t is not None and t not in common:
+                    raise ValueError(f"{path}: variante {v['name']}: destino {t!r} no está en 'common'")
     return m
+
+
+def _policies(p) -> dict:
+    """``unmapped_prediction`` como escalar (ambos lados) o {mine, mauricio}."""
+    out = {"mine": p, "mauricio": p} if isinstance(p, str) else {"mine": "error", "mauricio": "error", **(p or {})}
+    for side, v in out.items():
+        if v not in ("error", "drop"):
+            raise ValueError(f"unmapped_prediction[{side}] debe ser 'error' o 'drop', no {v!r}")
+    return out
+
+
+def apply_variant(mapping: dict, variant: dict) -> dict:
+    """Esquema principal con los cambios de una variante (mapeos por lado y política de predicción)."""
+    return {**mapping,
+            "mine": {**mapping["mine"], **(variant.get("mine") or {})},
+            "mauricio": {**mapping["mauricio"], **(variant.get("mauricio") or {})},
+            "unmapped_prediction": {**mapping["unmapped_prediction"], **(variant.get("unmapped_prediction") or {})}}
+
+
+def pred_into_null_pct(cm: np.ndarray, fine: list[str], mapping: dict) -> dict[str, float]:
+    """% de píxeles etiquetados (real en una clase con destino) predichos como cada clase sin destino."""
+    cm = np.asarray(cm, np.float64)
+    if cm.ndim == 3:
+        cm = cm.sum(0)
+    rows = [i for i, c in enumerate(fine) if mapping[c] is not None]
+    tot = cm[rows].sum()
+    return {c: (float(100 * cm[rows, j].sum() / tot) if tot else float("nan"))
+            for j, c in enumerate(fine) if mapping[c] is None}
 
 
 def check_mapping_covers(mapping: dict, side: str, fine: list[str]) -> None:
@@ -447,10 +485,25 @@ def read_mauricio(xlsx: Path) -> dict:
 
 def analysis_a3(runs: list[Run], classes: list[str], mapping: dict, mau: Optional[dict], K: int,
                 n_boot: int = 2000, seed: int = 0) -> dict:
+    """Esquema principal + variantes de sensibilidad (``variants`` del YAML)."""
+    if not isinstance(mapping.get("unmapped_prediction"), dict) or set(mapping["unmapped_prediction"]) != {"mine", "mauricio"}:
+        mapping = {**mapping, "unmapped_prediction": _policies(mapping.get("unmapped_prediction", "error"))}
+    out = _a3_core(runs, classes, mapping, mau, K, n_boot, seed)
+    out["variants"] = []
+    for v in mapping.get("variants") or []:
+        res = _a3_core(runs, classes, apply_variant(mapping, v), mau, K, n_boot, seed)
+        out["variants"].append({"name": v["name"], "description": " ".join(str(v.get("description", "")).split()),
+                                "result": res})
+    return out
+
+
+def _a3_core(runs: list[Run], classes: list[str], mapping: dict, mau: Optional[dict], K: int,
+             n_boot: int, seed: int) -> dict:
     common = list(mapping["common"])
-    pol = mapping.get("unmapped_prediction", "error")
+    pol = mapping["unmapped_prediction"]
     check_mapping_covers(mapping, "mine", classes)
-    out = {"common": common, "policy": pol, "mine": {}, "mauricio": None}
+    out = {"common": common, "policy": pol, "mine": {}, "mauricio": None,
+           "mapping_mine": dict(mapping["mine"]), "mapping_mauricio": dict(mapping["mauricio"])}
     for c in configs_in(runs):
         rr = sorted([r for r in runs if r.config == c], key=lambda r: (r.seed, r.fold))
         seeds = sorted({r.seed for r in rr})
@@ -459,9 +512,10 @@ def analysis_a3(runs: list[Run], classes: list[str], mapping: dict, mau: Optiona
         s0 = [r for r in rr if r.seed == seeds[0]]
         cms = np.concatenate([r.cms for r in s0])
         names = [n for r in s0 for n in r.names]
-        agg, cn = aggregate(cms, classes, mapping["mine"], common, pol)
+        agg, cn = aggregate(cms, classes, mapping["mine"], common, pol["mine"])
         rep = M.evaluate(agg, cn, names, min_photos=K, n_boot=n_boot, seed=seed)
         rep["n_seeds_available"] = len(seeds)
+        rep["pred_en_clases_sin_destino_pct"] = pred_into_null_pct(cms, classes, mapping["mine"])
         out["mine"][c] = rep
     if mau is not None:
         check_mapping_covers(mapping, "mauricio", mau["classes"])
@@ -469,13 +523,14 @@ def analysis_a3(runs: list[Run], classes: list[str], mapping: dict, mau: Optiona
         iou_fine = M.per_class(mau["cm"])["iou"]
         diffs = {n: abs(float(iou_fine[i]) - mau["iou_test"][n]) for i, n in enumerate(mau["classes"])
                  if n in mau["iou_test"]}
-        agg, cn = aggregate(mau["cm"], mau["classes"], mapping["mauricio"], common, pol)
+        agg, cn = aggregate(mau["cm"], mau["classes"], mapping["mauricio"], common, pol["mauricio"])
         pc = M.per_class(agg)
         ev = np.array([n != OUT_CLASS and pc["gt_px"][i] > 0 for i, n in enumerate(cn)])
         out["mauricio"] = {"classes": cn, "confusion": agg.tolist(), "summary": M.summarize(agg, ev),
                            "iou": {n: (None if not np.isfinite(pc["iou"][i]) else float(pc["iou"][i]))
                                    for i, n in enumerate(cn)},
                            "gt_px": {n: int(pc["gt_px"][i]) for i, n in enumerate(cn)},
+                           "pred_en_clases_sin_destino_pct": pred_into_null_pct(mau["cm"], mau["classes"], mapping["mauricio"]),
                            "check_max_abs_diff_iou_fino": max(diffs.values()) if diffs else None,
                            "config": mau["config"]}
     # mIoU sobre las clases comunes evaluables en AMBOS lados
@@ -640,6 +695,8 @@ def run(study: Path, manifest: Path, out: Path, dataset_cfg: Path, mapping_path:
             a3_status = "calculado"
             (tables / "A3_esquema_comun.json").write_text(json.dumps(a3, indent=1, ensure_ascii=False), encoding="utf-8")
             write_csv(tables / "A3_esquema_comun_por_clase.csv", _a3_rows(a3))
+            for v in a3["variants"]:
+                write_csv(tables / f"A3_sensibilidad_{v['name']}_por_clase.csv", _a3_rows(v["result"]))
             if mau is not None and a3["mauricio"]["check_max_abs_diff_iou_fino"] is not None:
                 d = a3["mauricio"]["check_max_abs_diff_iou_fino"]
                 checks.append(("IoU fino de Mauricio recalculado de su matriz = hoja IoU_por_clase", d < 5e-4,
@@ -687,6 +744,31 @@ def _a3_rows(a3: dict) -> list[dict]:
 
 
 # ============================================================================ REPORT.md
+
+def _a3_table(a3: dict) -> list[str]:
+    cfgs = list(a3["mine"])
+    L = ["| Clase común | " + " | ".join(f"{c} (Pascual) [IC 95 %]" for c in cfgs)
+         + " | Mauricio run05_b3_v2 (otro dataset, sin IC) |", "|---|" + "---|" * (len(cfgs) + 1)]
+    for n in a3["common"]:
+        cells = []
+        for c in cfgs:
+            x = next(x for x in a3["mine"][c]["classes"] if x["class"] == n)
+            cells.append(f"{_f(x['iou'], 1, True)} {_ci(x['iou_ci'], 1, True)}" + ("" if x["evaluable"] else "*"))
+        mv = a3["mauricio"]["iou"].get(n) if a3["mauricio"] else None
+        L.append(f"| {n} | " + " | ".join(cells) + f" | {_f(mv, 1, True)} |")
+    L.append("| **mIoU (evaluables)** | " + " | ".join(
+        f"{_f(a3['mine'][c]['mIoU'], 1, True)} {_ci((a3['mine'][c]['ci'] or {}).get('mIoU'), 1, True)}" for c in cfgs)
+        + f" | {_f(a3['mauricio']['summary']['mIoU'], 1, True) if a3['mauricio'] else '—'} |")
+    if a3["mauricio"]:
+        L.append("| **mIoU (clases evaluables en ambos lados)** | " + " | ".join(
+            _f(a3["mine"][c]["mIoU_clases_compartidas"], 1, True) for c in cfgs) + " | " +
+            " / ".join(f"{c}: {_f(v, 1, True)}" for c, v in a3["mauricio"]["mIoU_clases_compartidas_por_config"].items()) + " |")
+        L.append(f"| OA | " + " | ".join(_f(a3["mine"][c]["OA"], 1, True) for c in cfgs)
+                 + f" | {_f(a3['mauricio']['summary']['OA'], 1, True)} |")
+    L += ["", "\\* = no evaluable en el lado propio (< K fotos). Valores en %. En la última fila de mIoU, la columna de "
+          "Mauricio se calcula sobre las mismas clases que cada config propia."]
+    return L
+
 
 def to_report(R: dict, out: Path) -> str:
     p, rep = R["params"], R["report"]
@@ -736,7 +818,7 @@ def to_report(R: dict, out: Path) -> str:
           "Split aleatorio original: nombres de las fotos en orden alfabético, "
           "`sklearn.model_selection.train_test_split(train_size=0.8, random_state=42, shuffle=True)` "
           "(reimplementado sin sklearn: `RandomState(42).permutation`, test = primeros 14, train = 52). "
-          "Supuesto: las 66 fotos del segpack_v1 son las que usó el notebook original.", "",
+          "Hecho confirmado por el autor: el notebook original usó estas mismas 66 fotos (segpack_v1).", "",
           "| Esquema | Pliegue | Train | Test | Solape unión (%) | Cobertura por foto mediana (%) | Dist. mín. (m) |",
           "|---|---|---|---|---|---|---|"]
     for r in a1["rows"]:
@@ -790,30 +872,38 @@ def to_report(R: dict, out: Path) -> str:
     L += ["", "## 5. A3 — Esquema común con Mauricio", "", f"Estado: {R['a3_status']}."]
     a3 = R["a3"]
     if a3:
-        L += ["", f"Mapeo: `{R['mapping']}`. Clases comunes: {', '.join(a3['common'])}. Predicciones en clases sin destino: "
-              f"`{a3['policy']}`. Agregación: suma de filas y columnas de la matriz por foto según el mapeo; mIoU sobre clases "
-              f"evaluables (≥ {R['K']} fotos) del lado propio; IC por bootstrap de fotos.", "",
+        pol = a3["policy"]
+        L += ["", f"Mapeo: `{R['mapping']}` (aprobado por el autor). Clases comunes: {', '.join(a3['common'])}. "
+              "Agregación: suma de filas (real) y columnas (predicha) de la matriz por foto según el mapeo; una clase con "
+              "destino `null` no entra: sus píxeles reales se ignoran y lo predicho en ella sobre píxeles etiquetados va a "
+              f"`{OUT_CLASS}` (cuenta como error; política `error`) o se descarta (política `drop`). Política: propio "
+              f"`{pol['mine']}`, Mauricio `{pol['mauricio']}`. mIoU propio sobre clases evaluables (≥ {R['K']} fotos), "
+              "IC por bootstrap de fotos.", "",
+              "Verificación del mapeo de Mauricio: por inspección visual de sus máscaras (su `via_pavimentada` incluye vías "
+              "pavimentadas, andenes y plazas); no existe una definición escrita de sus clases.", "",
               "**Datasets distintos**: el lado propio es Pascual Guerrero (66 fotos, CV por bloques, test agrupado de 5 pliegues); "
               "el de Mauricio es su dataset v2 (38 fotos de prueba de una zona no vista, una sola partición). "
-              "La matriz de Mauricio es agregada (no hay matrices por foto): no tiene IC.", ""]
-        cfgs = list(a3["mine"])
-        head = "| Clase común | " + " | ".join(f"{c} (Pascual)" for c in cfgs) + " | Mauricio run05_b3_v2 (otro dataset) |"
-        L += [head, "|---|" + "---|" * (len(cfgs) + 1)]
-        for n in a3["common"]:
-            cells = []
-            for c in cfgs:
-                x = next(x for x in a3["mine"][c]["classes"] if x["class"] == n)
-                cells.append(f"{_f(x['iou'], 1, True)} {_ci(x['iou_ci'], 1, True)}" + ("" if x["evaluable"] else "*"))
-            mv = a3["mauricio"]["iou"].get(n) if a3["mauricio"] else None
-            L.append(f"| {n} | " + " | ".join(cells) + f" | {_f(mv, 1, True)} |")
-        L.append("| **mIoU (evaluables)** | " + " | ".join(
-            f"{_f(a3['mine'][c]['mIoU'], 1, True)} {_ci((a3['mine'][c]['ci'] or {}).get('mIoU'), 1, True)}" for c in cfgs)
-            + f" | {_f(a3['mauricio']['summary']['mIoU'], 1, True) if a3['mauricio'] else '—'} |")
+              "La matriz de Mauricio es agregada (no hay matrices por foto): su columna no tiene IC.", ""]
+        L += _a3_table(a3)
         if a3["mauricio"]:
-            L.append("| **mIoU (clases compartidas)** | " + " | ".join(
-                _f(a3["mine"][c]["mIoU_clases_compartidas"], 1, True) for c in cfgs) + " | " +
-                " / ".join(f"{c}: {_f(v, 1, True)}" for c, v in a3["mauricio"]["mIoU_clases_compartidas_por_config"].items()) + " |")
-        L += ["", "\\* = no evaluable en el lado propio (< K fotos). Valores en %."]
+            pct = a3["mauricio"]["pred_en_clases_sin_destino_pct"]
+            L += ["", "Píxeles etiquetados (real en una clase con destino) que el modelo de Mauricio predijo en una clase sin destino: "
+                  + ", ".join(f"`{c}` {_f(v, 2)} %" for c, v in pct.items()) + ". "
+                  "Mis modelos no tienen esa salida: predicen solo las 12 clases de `classes.json` (background es "
+                  "`ignore_index` y nunca se predice), y en el esquema principal las 12 tienen destino."]
+        for v in a3.get("variants") or []:
+            res = v["result"]
+            L += ["", f"### Sensibilidad: {v['name']}", "", v["description"], ""]
+            L += _a3_table(res)
+            mine_pct = {c: rep.get("pred_en_clases_sin_destino_pct") or {} for c, rep in res["mine"].items()}
+            if any(mine_pct.values()):
+                L += ["", "Píxeles etiquetados que mis modelos predijeron en clases sin destino: " + "; ".join(
+                    f"{c}: " + ", ".join(f"`{k}` {_f(x, 2)} %" for k, x in d.items()) for c, d in mine_pct.items()) + "."]
+            if res["mauricio"]:
+                L += ["", "Mauricio en esta variante: " + ", ".join(
+                    f"`{k}` {_f(x, 2)} % de los píxeles etiquetados"
+                    for k, x in res["mauricio"]["pred_en_clases_sin_destino_pct"].items())
+                    + f" (política `{res['policy']['mauricio']}`)."]
 
     # costo y pliegues
     L += ["", "## 6. Costo", "", "Horas = suma de los segundos por época de `epoch_log` (entrenamiento + validación), "

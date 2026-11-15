@@ -177,7 +177,10 @@ def test_pair_j0_vs_b75_separates_within_fold():
 
 MAP = {"approved": True, "unmapped_prediction": "error", "common": ["paved", "green"],
        "mine": {"Road": "paved", "Vegetation": "green", "Fence": None},
-       "mauricio": {"sin_clase": None, "via": "paved", "veg_alta": "green", "veg_baja": "green"}}
+       "mauricio": {"sin_clase": None, "via": "paved", "veg_alta": "green", "veg_baja": "green"},
+       "variants": [{"name": "fence_a_paved", "description": "Fence → paved", "mine": {"Fence": "paved"}},
+                    {"name": "sin_clase_descartado", "description": "drop",
+                     "unmapped_prediction": {"mauricio": "drop"}}]}
 
 
 def test_aggregate_fine_to_coarse_by_hand():
@@ -204,9 +207,30 @@ def test_mapping_validation(tmp_path):
         A.check_mapping_covers({"mine": {"Road": "paved"}}, "mine", CLASSES)
 
 
-def test_repo_mapping_proposal_covers_both_schemes():
+def test_repo_mapping_is_approved_with_sensitivity_variants():
     m = A.load_mapping(A.REPO / "configs" / "analysis" / "common_scheme.yaml")
+    assert m["approved"] is True
     assert len(m["mine"]) == 12 and len(m["mauricio"]) == 10
+    assert m["mine"]["Sports Fields"] == "vegetacion" and m["mauricio"]["sin_clase"] is None
+    assert m["unmapped_prediction"] == {"mine": "error", "mauricio": "error"}
+    v = {x["name"]: A.apply_variant(m, x) for x in m["variants"]}
+    assert v["sports_fields_fuera"]["mine"]["Sports Fields"] is None
+    assert v["sports_fields_fuera"]["mine"]["Vegetation"] == "vegetacion"
+    assert v["sin_clase_descartado"]["unmapped_prediction"] == {"mine": "error", "mauricio": "drop"}
+
+
+def test_pred_into_null_pct_by_hand():
+    cm = np.array([[50, 5, 5, 0], [10, 100, 0, 0], [0, 0, 80, 20], [0, 5, 10, 60]])
+    pct = A.pred_into_null_pct(cm, ["sin_clase", "via", "veg_alta", "veg_baja"], MAP["mauricio"])
+    # filas etiquetadas = 1..3 (285 px); columna sin_clase en esas filas = 10
+    assert pct == {"sin_clase": pytest.approx(100 * 10 / 285)}
+
+
+def test_variant_with_unknown_class_is_rejected(tmp_path):
+    p = tmp_path / "m.yaml"
+    p.write_text(yaml.safe_dump({**MAP, "variants": [{"name": "x", "mine": {"Nope": None}}]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="clase desconocida"):
+        A.load_mapping(p)
 
 
 def write_mauricio(path):
@@ -249,8 +273,18 @@ def test_end_to_end_reads_only_and_writes_report(tmp_path):
     assert A.snapshot(study / "runs") == before
     assert all(ok for _, ok, _ in res["checks"]), res["checks"]
     assert res["a3_status"] == "calculado"
+    a3 = res["a3"]
+    assert [v["name"] for v in a3["variants"]] == ["fence_a_paved", "sin_clase_descartado"]
+    # principal: Fence sin destino → la columna fuera_de_esquema existe en mis matrices
+    assert a3["mine"]["J0"]["classes"][-1]["class"] == A.OUT_CLASS
+    drop = a3["variants"][1]["result"]["mauricio"]
+    assert A.OUT_CLASS not in drop["classes"] and A.OUT_CLASS in a3["mauricio"]["classes"]
+    # descartar sin_clase no puede bajar el IoU de Mauricio
+    assert all(drop["iou"][n] >= a3["mauricio"]["iou"][n] - 1e-12 for n in MAP["common"])
+    assert (out / "tables" / "A3_sensibilidad_fence_a_paved_por_clase.csv").exists()
     txt = (out / "REPORT.md").read_text(encoding="utf-8")
-    for s in ("A1", "A2", "A3", "fuga reducida".split()[0], "Datasets distintos", "Costo"):
+    for s in ("A1", "A2", "A3", "Datasets distintos", "Costo", "Sensibilidad: fence_a_paved",
+              "Mis modelos no tienen esa salida", "inspección visual", "Hecho confirmado", "sin IC"):
         assert s in txt
     assert "sin fuga" not in txt.lower()
     for f in res["figures"]:

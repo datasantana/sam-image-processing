@@ -1,15 +1,21 @@
-# Esquema común Pascual (12 clases) ↔ Mauricio (run05_b3_v2, 10 clases) — PROPUESTA.
-# A3 no se calcula mientras approved sea false.
+# Esquema común Pascual (12 clases) ↔ Mauricio (run05_b3_v2, 10 clases).
+# Aprobado por el autor el 2026-11-15.
 #
 # Reglas de agregación (segpipe.analyze.aggregate):
 #  - Se suman filas (clase real) y columnas (clase predicha) de la matriz de confusión según el mapeo.
 #  - null = la clase no entra al esquema común: sus píxeles reales se ignoran (como background).
-#  - unmapped_prediction: qué hacer con píxeles PREDICHOS en una clase null.
+#  - unmapped_prediction (por lado): qué hacer con píxeles PREDICHOS en una clase null.
 #      error → van a una columna "fuera_de_esquema": cuentan como fallo de la clase real y no entran al mIoU.
 #      drop  → se descartan (como si no se hubieran predicho).
+#
+# Verificación del mapeo de Mauricio: por inspección visual de sus máscaras (el autor revisó que su
+# via_pavimentada incluye vías pavimentadas, andenes y plazas). NO hay una definición escrita de sus
+# clases; el mapeo no se verificó contra una.
 
-approved: false
-unmapped_prediction: error
+approved: true
+unmapped_prediction:
+  mine: error          # sin efecto en el esquema principal: las 12 clases propias tienen destino
+  mauricio: error      # lo predicho como sin_clase sobre píxeles etiquetados cuenta como error
 
 common:
   - edificacion
@@ -28,16 +34,16 @@ mine:                       # clases de classes.json (background ya es ignore_in
   Brownfields: suelo_sin_pavimentar
   Ground Surface: suelo_sin_pavimentar
   Vegetation: vegetacion
-  Sports Fields: vegetacion          # DUDA 1: cancha de césped → vegetación; si no, null
+  Sports Fields: vegetacion          # principalmente césped natural del estadio (decisión del autor)
   Pools: agua
   Vehicle: vehiculo
   Fence: otros_objetos
   Lightning Posts: otros_objetos
 
 mauricio:                   # columnas de Matriz_confusion de Metricas_run05_b3_v2.xlsx
-  sin_clase: null                    # DUDA 2: no entra a su criterio; filas ignoradas
+  sin_clase: null                    # no entra a su criterio; filas (real) ignoradas
   edificacion: edificacion
-  via_pavimentada: superficie_pavimentada
+  via_pavimentada: superficie_pavimentada   # incluye vías pavimentadas, andenes y plazas (inspección visual)
   via_destapada: suelo_sin_pavimentar
   suelo_desnudo: suelo_sin_pavimentar
   vegetacion_alta: vegetacion
@@ -45,3 +51,17 @@ mauricio:                   # columnas de Matriz_confusion de Metricas_run05_b3_
   agua: agua
   vehiculo: vehiculo
   otros_objetos: otros_objetos
+
+# Análisis de sensibilidad (tablas aparte). Cada variante parte del esquema principal y cambia solo
+# lo indicado.
+variants:
+  - name: sports_fields_fuera
+    description: >-
+      Sports Fields fuera del esquema: sus píxeles reales se ignoran y lo que mis modelos predicen como
+      Sports Fields sobre píxeles etiquetados de otras clases cuenta como error (misma regla que sin_clase).
+    mine: {Sports Fields: null}
+  - name: sin_clase_descartado
+    description: >-
+      Lo que el modelo de Mauricio predijo como sin_clase sobre píxeles etiquetados se descarta en vez de
+      contar como error.
+    unmapped_prediction: {mauricio: drop}
