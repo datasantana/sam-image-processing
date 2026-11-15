@@ -17,14 +17,22 @@ unmapped_prediction:
   mine: error          # sin efecto en el esquema principal: las 12 clases propias tienen destino
   mauricio: error      # lo predicho como sin_clase sobre píxeles etiquetados cuenta como error
 
-# Criterio de clase evaluable del esquema común (decisión del autor, 2026-11-15). Se aplica a AMBOS lados:
-#  - min_photos: la clase aparece en ≥ K fotos de test (K = 5, el mismo de mis corridas). Mauricio no tiene
-#    matrices por foto: la regla solo se le aplica donde su xlsx declara el nº de fotos (LEEME: agua, 6 fotos).
-#  - min_pixel_share_pct: la clase tiene ≥ 0.1 % de los píxeles reales etiquetados del esquema común.
-#    Con esto sale el agua de Mauricio (73.473 px = 0.049 %); en Pascual la clase común más pequeña tiene 0.77 %.
+# Criterio de clase evaluable del esquema común (decisión del autor, 2026-11-15): regla ÚNICA, igual en
+# ambos lados, sin criterios adicionales.
+#  - min_photos: la clase aparece en ≥ 5 fotos de test (el mismo K de mis corridas). Mauricio no tiene
+#    matrices por foto: la regla se le aplica donde su xlsx declara el nº de fotos (LEEME: agua, 6 fotos →
+#    evaluable); en el resto de sus clases no hay nº de fotos y se consideran evaluables si tienen píxeles.
+#  - min_pixel_share_pct: null (sin umbral de píxeles). El soporte en píxeles se reporta solo como descripción.
+#  - exclude: {} (sin exclusiones en el esquema principal; la variante sin_agua lo usa).
 evaluability:
   min_photos: 5
-  min_pixel_share_pct: 0.1
+  min_pixel_share_pct: null
+  exclude: {}
+
+# Notas al pie de la tabla principal, por lado y clase común.
+footnotes:
+  mauricio:
+    agua: "6 fotos de prueba; el autor la reporta como no concluyente; sin IC"
 
 common:
   - edificacion
@@ -74,8 +82,11 @@ variants:
       Lo que el modelo de Mauricio predijo como sin_clase sobre píxeles etiquetados se descarta en vez de
       contar como error.
     unmapped_prediction: {mauricio: drop}
-  - name: solo_regla_de_fotos
+  - name: sin_agua
     description: >-
-      Sin umbral de píxeles: solo la regla de ≥ 5 fotos. El agua de Mauricio (6 fotos declaradas en su LEEME)
-      queda evaluable.
-    evaluability: {min_pixel_share_pct: null}
+      Agua fuera del mIoU en ambos lados (sus píxeles siguen en la matriz y en la OA). Justificación: la hoja
+      LEEME de Mauricio dice «Agua: solo 73.473 px y 6 fotos en prueba; se reporta pero no es concluyente».
+      Es análisis de sensibilidad; la cifra principal incluye agua.
+    evaluability:
+      exclude:
+        agua: "variante sin_agua (LEEME de Mauricio: 6 fotos, no concluyente)"

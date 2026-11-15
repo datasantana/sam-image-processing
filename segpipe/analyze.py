@@ -44,6 +44,7 @@ REPO = Path(__file__).resolve().parents[1]
 LADDER_FIG = ["J0", "J0-pasos", "J1", "J2", "J3", "M-b3"]
 CONFIG_ORDER = ["J0", "J0-pasos", "J1", "J2", "J3", "M-b3", "J0-b75"]
 OUT_CLASS = "fuera_de_esquema"
+DEFAULT_MIN_PHOTOS = 5          # regla de clase evaluable del esquema común (la misma K de las corridas)
 
 
 # ============================================================================ localizar el estudio
@@ -400,6 +401,13 @@ def load_mapping_dict(m: dict, path="mapeo") -> dict:
         bad = {f: t for f, t in m[side].items() if t is not None and t not in common}
         if bad:
             raise ValueError(f"{path}: destinos que no están en 'common' ({side}): {bad}")
+    for side, notes in (m.get("footnotes") or {}).items():
+        if side not in ("mine", "mauricio") or any(k not in common for k in (notes or {})):
+            raise ValueError(f"{path}: footnotes debe ser {{mine|mauricio: {{clase común: texto}}}}")
+    for ev in [m.get("evaluability") or {}] + [v.get("evaluability") or {} for v in m.get("variants") or []]:
+        bad = [k for k in list(ev.get("exclude") or {}) + list(ev.get("mauricio_exclude") or {}) if k not in common]
+        if bad:
+            raise ValueError(f"{path}: exclusiones con clases que no están en 'common': {bad}")
     for v in m.get("variants") or []:
         if "name" not in v:
             raise ValueError(f"{path}: variante sin 'name'")
@@ -517,8 +525,9 @@ def analysis_a3(runs: list[Run], classes: list[str], mapping: dict, mau: Optiona
 def evaluability_rule(mapping: dict, K: int) -> dict:
     """Criterio de clase evaluable del esquema común (``evaluability`` del YAML)."""
     r = dict(mapping.get("evaluability") or {})
-    return {"min_photos": int(r.get("min_photos", K)),
+    return {"min_photos": int(r.get("min_photos", DEFAULT_MIN_PHOTOS)),
             "min_pixel_share_pct": (None if r.get("min_pixel_share_pct") is None else float(r["min_pixel_share_pct"])),
+            "exclude": dict(r.get("exclude") or {}),
             "mauricio_exclude": dict(r.get("mauricio_exclude") or {})}
 
 
@@ -537,6 +546,7 @@ def _a3_core(runs: list[Run], classes: list[str], mapping: dict, mau: Optional[d
     thr = rule["min_pixel_share_pct"]
     check_mapping_covers(mapping, "mine", classes)
     out = {"common": common, "policy": pol, "rule": rule, "mine": {}, "mauricio": None,
+           "footnotes": {side: dict((mapping.get("footnotes") or {}).get(side) or {}) for side in ("mine", "mauricio")},
            "mapping_mine": dict(mapping["mine"]), "mapping_mauricio": dict(mapping["mauricio"])}
 
     # --- Mauricio (matriz agregada: soporte por píxeles y, si su xlsx lo declara, por fotos)
@@ -567,6 +577,8 @@ def _a3_core(runs: list[Run], classes: list[str], mapping: dict, mau: Optional[d
                     why.append(f"{photos[n]} fotos < {rule['min_photos']}")
                 if thr is not None and share[i] < thr:
                     why.append(f"{share[i]:.3f} % de los píxeles < {thr:g} %")
+                if n in rule["exclude"]:
+                    why.append(str(rule["exclude"][n]))
                 if n in rule["mauricio_exclude"]:
                     why.append(str(rule["mauricio_exclude"][n]))
             ev.append(not why)
@@ -609,6 +621,8 @@ def _a3_core(runs: list[Run], classes: list[str], mapping: dict, mau: Optional[d
                     why.append(f"{int(npc[i])} fotos < {rule['min_photos']}")
                 if thr is not None and share[i] < thr:
                     why.append(f"{share[i]:.3f} % de los píxeles < {thr:g} %")
+                if n in rule["exclude"]:
+                    why.append(str(rule["exclude"][n]))
             ev.append(not why)
             reasons[n] = "; ".join(why)
         ev = np.array(ev)
@@ -849,9 +863,14 @@ def _a3_rows(a3: dict) -> list[dict]:
 
 
 def _rule_text(rule: dict) -> str:
-    t = f"≥ {rule['min_photos']} fotos de test con la clase (en Mauricio, solo donde su xlsx declara el nº de fotos)"
-    if rule["min_pixel_share_pct"] is not None:
+    t = (f"≥ {rule['min_photos']} fotos de test con la clase (en Mauricio, solo donde su xlsx declara el nº de fotos; "
+         "en sus demás clases basta con tener píxeles)")
+    if rule["min_pixel_share_pct"] is None:
+        t += "; sin umbral de píxeles"
+    else:
         t += f" y ≥ {rule['min_pixel_share_pct']:g} % de los píxeles etiquetados del esquema común (ambos lados)"
+    if rule["exclude"]:
+        t += "; exclusiones en ambos lados: " + "; ".join(f"{k} ({v})" for k, v in rule["exclude"].items())
     if rule["mauricio_exclude"]:
         t += "; exclusiones explícitas en Mauricio: " + "; ".join(f"{k} ({v})" for k, v in rule["mauricio_exclude"].items())
     return t
@@ -884,6 +903,7 @@ def _support_table(a3: dict) -> list[str]:
 def _a3_table(a3: dict) -> list[str]:
     cfgs = list(a3["mine"])
     m = a3["mauricio"]
+    marks: list[tuple[str, str]] = []
     L = ["| Clase común | " + " | ".join(f"{c} (Pascual) [IC 95 %]" for c in cfgs)
          + " | Mauricio run05_b3_v2 (otro dataset, sin IC) |", "|---|" + "---|" * (len(cfgs) + 1)]
     for n in a3["common"]:
@@ -892,6 +912,15 @@ def _a3_table(a3: dict) -> list[str]:
             x = next(x for x in a3["mine"][c]["classes"] if x["class"] == n)
             cells.append(f"{_f(x['iou'], 1, True)} {_ci(x['iou_ci'], 1, True)}" + ("" if x["evaluable"] else "*"))
         mv = (_f(m["iou"].get(n), 1, True) + ("" if m["evaluable"][n] else "*")) if m else "—"
+        for side, tag in (("mine", "propio"), ("mauricio", "Mauricio")):
+            note = a3.get("footnotes", {}).get(side, {}).get(n)
+            if note:
+                marks.append((f"{n} ({tag})", note))
+                dag = "†" * len(marks)
+                if side == "mauricio":
+                    mv += dag
+                else:
+                    cells = [c + dag for c in cells]
         L.append(f"| {n} | " + " | ".join(cells) + f" | {mv} |")
     L.append("| **(a) mIoU, clases evaluables de cada dataset** | " + " | ".join(
         f"{_f(a3['mine'][c]['mIoU'], 1, True)} {_ci((a3['mine'][c]['ci'] or {}).get('mIoU'), 1, True)}" for c in cfgs)
@@ -902,7 +931,8 @@ def _a3_table(a3: dict) -> list[str]:
     L.append("| OA (todos los píxeles del esquema) | " + " | ".join(_f(a3["mine"][c]["OA"], 1, True) for c in cfgs)
              + f" | {_f(m['summary']['OA'], 1, True) if m else '—'} |")
     own = a3.get("clases_evaluables_propio", [])
-    L += ["", "\\* = no evaluable en ese dataset. Valores en %.",
+    L += [""] + [f"{'†' * (i + 1)} {k}: {v}." for i, (k, v) in enumerate(marks)]
+    L += ["\\* = no evaluable en ese dataset. Valores en %.",
           f"- (a) Pascual ({len(own)}): {', '.join(own) or '—'}."]
     if m:
         L.append(f"- (a) Mauricio ({len(m['clases_evaluables'])}): {', '.join(m['clases_evaluables']) or '—'}.")
@@ -1031,7 +1061,8 @@ def to_report(R: dict, out: Path) -> str:
             L += ["Nº de fotos de prueba declarado en su xlsx (hoja LEEME): " + ", ".join(
                 f"{k}: {v}" for k, v in a3["mauricio"]["photos_stated"].items() if v is not None)
                 + ". Notas de LEEME: " + " | ".join(f"«{t}»" for t in R.get("mauricio_leeme", [])) + "", ""]
-        L += ["Soporte por clase común (píxeles reales en test; % sobre los píxeles etiquetados del esquema común):", ""]
+        L += ["Soporte por clase común (tabla descriptiva: píxeles reales en test, % sobre los píxeles etiquetados del "
+              "esquema común y nº de fotos cuando se conoce). Salvo la regla de fotos, no se usa para excluir clases:", ""]
         L += _support_table(a3)
         L += [""]
         L += _a3_table(a3)

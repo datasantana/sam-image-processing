@@ -217,8 +217,16 @@ def test_repo_mapping_is_approved_with_sensitivity_variants():
     assert v["sports_fields_fuera"]["mine"]["Sports Fields"] is None
     assert v["sports_fields_fuera"]["mine"]["Vegetation"] == "vegetacion"
     assert v["sin_clase_descartado"]["unmapped_prediction"] == {"mine": "error", "mauricio": "drop"}
-    assert m["evaluability"] == {"min_photos": 5, "min_pixel_share_pct": 0.1}
-    assert v["solo_regla_de_fotos"]["evaluability"] == {"min_photos": 5, "min_pixel_share_pct": None}
+    # regla única: ≥ 5 fotos, sin umbral de píxeles, sin exclusiones; agua evaluable en la tabla principal
+    assert m["evaluability"] == {"min_photos": 5, "min_pixel_share_pct": None, "exclude": {}}
+    assert A.evaluability_rule(m, K=99)["min_photos"] == 5
+    assert A.evaluability_rule({}, K=99) == {"min_photos": 5, "min_pixel_share_pct": None, "exclude": {},
+                                             "mauricio_exclude": {}}
+    assert "no concluyente" in m["footnotes"]["mauricio"]["agua"] and "sin IC" in m["footnotes"]["mauricio"]["agua"]
+    assert set(v) == {"sports_fields_fuera", "sin_clase_descartado", "sin_agua"}
+    assert list(v["sin_agua"]["evaluability"]["exclude"]) == ["agua"]
+    assert v["sin_agua"]["evaluability"]["min_photos"] == 5
+    assert "LEEME" in next(x for x in m["variants"] if x["name"] == "sin_agua")["description"]
 
 
 def test_pred_into_null_pct_by_hand():
@@ -373,3 +381,35 @@ def test_pixel_share_rule_applies_to_both_sides(tmp_path):
     mp["variants"] = [{"name": "sin_umbral", "description": "x", "evaluability": {"min_pixel_share_pct": None}}]
     out = A.analysis_a3(runs, CLASSES, A.load_mapping_dict(mp), mau, K=1, n_boot=30)
     assert out["variants"][0]["result"]["mauricio"]["evaluable"]["paved"]
+
+
+def test_mauricio_agua_rule_exclude_variant_and_footnote():
+    """Con ≥ 5 fotos, una clase con 6 fotos declaradas es evaluable; 'exclude' la quita en ambos lados."""
+    cls = ["sin_clase", "via", "agua"]
+    mau = {"classes": cls, "cm": np.array([[5, 1, 0], [2, 100, 0], [1, 3, 4]]), "iou_test": {},
+           "photos_stated": {"agua": 6}, "config": {}}
+    fine = ["Road", "Pools"]
+    mp = A.load_mapping_dict({
+        "approved": True, "common": ["paved", "agua"],
+        "mine": {"Road": "paved", "Pools": "agua"},
+        "mauricio": {"sin_clase": None, "via": "paved", "agua": "agua"},
+        "evaluability": {"min_photos": 5, "min_pixel_share_pct": None, "exclude": {}},
+        "footnotes": {"mauricio": {"agua": "6 fotos de prueba; el autor la reporta como no concluyente; sin IC"}},
+        "variants": [{"name": "sin_agua", "description": "LEEME",
+                      "evaluability": {"exclude": {"agua": "variante sin_agua"}}}]})
+
+    class R:
+        config, seed, fold = "J0", 42, 0
+        names = [f"p{i}" for i in range(6)]
+        cms = np.stack([np.array([[50, 2], [1, 9]])] * 6)
+    out = A.analysis_a3([R()], fine, mp, mau, K=5, n_boot=20)
+    m, j0 = out["mauricio"], out["mine"]["J0"]
+    assert m["evaluable"]["agua"] and j0["evaluable_classes"] == ["paved", "agua"]
+    assert out["clases_interseccion"] == ["paved", "agua"]                 # agua entra en (b)
+    sin = out["variants"][0]["result"]
+    assert not sin["mauricio"]["evaluable"]["agua"] and sin["mine"]["J0"]["evaluable_classes"] == ["paved"]
+    assert sin["clases_interseccion"] == ["paved"]
+    txt = "\n".join(A._a3_table(out))
+    assert "| agua |" in txt and "†" in txt
+    assert "† agua (Mauricio): 6 fotos de prueba; el autor la reporta como no concluyente; sin IC." in txt
+    assert "(b) intersección (2): paved, agua." in txt
