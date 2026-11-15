@@ -1,0 +1,47 @@
+# Esquema común Pascual (12 clases) ↔ Mauricio (run05_b3_v2, 10 clases) — PROPUESTA.
+# A3 no se calcula mientras approved sea false.
+#
+# Reglas de agregación (segpipe.analyze.aggregate):
+#  - Se suman filas (clase real) y columnas (clase predicha) de la matriz de confusión según el mapeo.
+#  - null = la clase no entra al esquema común: sus píxeles reales se ignoran (como background).
+#  - unmapped_prediction: qué hacer con píxeles PREDICHOS en una clase null.
+#      error → van a una columna "fuera_de_esquema": cuentan como fallo de la clase real y no entran al mIoU.
+#      drop  → se descartan (como si no se hubieran predicho).
+
+approved: false
+unmapped_prediction: error
+
+common:
+  - edificacion
+  - superficie_pavimentada
+  - suelo_sin_pavimentar
+  - vegetacion
+  - agua
+  - vehiculo
+  - otros_objetos
+
+mine:                       # clases de classes.json (background ya es ignore_index)
+  Buildings: edificacion
+  Road Surface: superficie_pavimentada
+  Paved Surface: superficie_pavimentada
+  Parkinglots: superficie_pavimentada
+  Brownfields: suelo_sin_pavimentar
+  Ground Surface: suelo_sin_pavimentar
+  Vegetation: vegetacion
+  Sports Fields: vegetacion          # DUDA 1: cancha de césped → vegetación; si no, null
+  Pools: agua
+  Vehicle: vehiculo
+  Fence: otros_objetos
+  Lightning Posts: otros_objetos
+
+mauricio:                   # columnas de Matriz_confusion de Metricas_run05_b3_v2.xlsx
+  sin_clase: null                    # DUDA 2: no entra a su criterio; filas ignoradas
+  edificacion: edificacion
+  via_pavimentada: superficie_pavimentada
+  via_destapada: suelo_sin_pavimentar
+  suelo_desnudo: suelo_sin_pavimentar
+  vegetacion_alta: vegetacion
+  vegetacion_baja: vegetacion
+  agua: agua
+  vehiculo: vehiculo
+  otros_objetos: otros_objetos
