@@ -217,6 +217,8 @@ def test_repo_mapping_is_approved_with_sensitivity_variants():
     assert v["sports_fields_fuera"]["mine"]["Sports Fields"] is None
     assert v["sports_fields_fuera"]["mine"]["Vegetation"] == "vegetacion"
     assert v["sin_clase_descartado"]["unmapped_prediction"] == {"mine": "error", "mauricio": "drop"}
+    assert m["evaluability"] == {"min_photos": 5, "min_pixel_share_pct": 0.1}
+    assert v["solo_regla_de_fotos"]["evaluability"] == {"min_photos": 5, "min_pixel_share_pct": None}
 
 
 def test_pred_into_null_pct_by_hand():
@@ -233,7 +235,7 @@ def test_variant_with_unknown_class_is_rejected(tmp_path):
         A.load_mapping(p)
 
 
-def write_mauricio(path):
+def write_mauricio(path, leeme=None):
     pd = pytest.importorskip("pandas")
     pytest.importorskip("openpyxl")
     cls = ["sin_clase", "via", "veg_alta", "veg_baja"]
@@ -243,6 +245,8 @@ def write_mauricio(path):
         pd.DataFrame(cm, index=cls, columns=cls).to_excel(xw, sheet_name="Matriz_confusion")
         pd.DataFrame({"Clase": cls, "IoU prueba": np.round(iou, 4)}).to_excel(xw, sheet_name="IoU_por_clase", index=False)
         pd.DataFrame({"Parametro": ["modelo"], "Valor": ["nvidia/mit-b3"]}).to_excel(xw, sheet_name="Config", index=False)
+        if leeme is not None:
+            pd.DataFrame(leeme).to_excel(xw, sheet_name="LEEME", index=False, header=False)
     return cm
 
 
@@ -313,3 +317,59 @@ def test_find_study_order(tmp_path, monkeypatch):
     monkeypatch.setenv("SEGPIPE_STUDY", str(tmp_path / "env"))
     assert A.find_study(str(tmp_path / "arg")) == (tmp_path / "arg", "argumento --study")
     assert A.find_study(None) == (tmp_path / "env", "variable SEGPIPE_STUDY")
+
+
+# ----------------------------------------------------------------------------- A3: criterio de evaluable
+
+def _a3_inputs(tmp_path, leeme=None, **rule):
+    study, man, dcfg = make_study(tmp_path, configs=("J0",))
+    runs, _ = A.load_runs(study)
+    write_mauricio(tmp_path / "mau.xlsx", leeme)
+    mau = A.read_mauricio(tmp_path / "mau.xlsx")
+    mp = {**MAP, "unmapped_prediction": {"mine": "error", "mauricio": "error"}, "variants": [],
+          "evaluability": {"min_photos": 1, **rule}}
+    return runs, mau, mp
+
+
+def test_leeme_photo_count_is_parsed(tmp_path):
+    write_mauricio(tmp_path / "m.xlsx", ["Título", "via: solo 1.000 px y 3 fotos en prueba; no concluyente.",
+                                         "Otra nota con 7 fotos que no empieza por una clase"])
+    assert A.read_mauricio(tmp_path / "m.xlsx")["photos_stated"] == {"via": 3}
+
+
+def test_photo_rule_on_mauricio_and_intersection(tmp_path):
+    runs, mau, mp = _a3_inputs(tmp_path, ["via: solo 115 px y 3 fotos en prueba"])
+    mp["evaluability"]["min_photos"] = 5
+    for r in runs:                                   # que el lado propio sea evaluable con K=5
+        r.cms = np.concatenate([r.cms] * 5)
+        r.names = r.names * 5
+    out = A.analysis_a3(runs, CLASSES, mp, mau, K=5, n_boot=30)
+    m = out["mauricio"]
+    assert m["photos_stated"] == {"paved": 3, "green": None}       # green viene de 2 clases finas
+    assert m["evaluable"] == {"paved": False, "green": True, A.OUT_CLASS: False}
+    assert "3 fotos < 5" in m["reason"]["paved"]
+    j0 = out["mine"]["J0"]
+    assert j0["evaluable_classes"] == ["paved", "green"]
+    assert out["clases_interseccion"] == ["green"]
+    # (b) intersección = IoU de green en ambos lados
+    green = next(x for x in j0["classes"] if x["class"] == "green")
+    assert j0["mIoU_interseccion"] == pytest.approx(green["iou"])
+    assert m["mIoU_interseccion"] == pytest.approx(m["iou"]["green"])
+    assert m["summary"]["mIoU"] == pytest.approx(m["iou"]["green"])   # (a) de Mauricio: solo green
+
+
+def test_pixel_share_rule_applies_to_both_sides(tmp_path):
+    runs, mau, mp = _a3_inputs(tmp_path, None, min_pixel_share_pct=45.0)
+    out = A.analysis_a3(runs, CLASSES, mp, mau, K=1, n_boot=30)
+    m = out["mauricio"]
+    sh = m["gt_share_pct"]
+    assert sh["paved"] + sh["green"] == pytest.approx(100)
+    assert m["evaluable"]["paved"] == (sh["paved"] >= 45) and m["evaluable"]["green"] == (sh["green"] >= 45)
+    for x in out["mine"]["J0"]["classes"]:
+        if x["class"] != A.OUT_CLASS:
+            assert x["evaluable"] == (x["gt_share_pct"] >= 45)
+            assert ("% de los píxeles" in x["reason"]) == (not x["evaluable"])
+    # variante que relaja el umbral
+    mp["variants"] = [{"name": "sin_umbral", "description": "x", "evaluability": {"min_pixel_share_pct": None}}]
+    out = A.analysis_a3(runs, CLASSES, A.load_mapping_dict(mp), mau, K=1, n_boot=30)
+    assert out["variants"][0]["result"]["mauricio"]["evaluable"]["paved"]

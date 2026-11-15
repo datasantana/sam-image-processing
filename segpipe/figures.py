@@ -292,26 +292,32 @@ def fig_a2_pair(pair: dict, out: Path):
 def fig_a3(a3: dict, out: Path):
     common = a3["common"]
     cfgs = list(a3["mine"])
-    series = [(c, {x["class"]: (x["iou"], x["iou_ci"]) for x in a3["mine"][c]["classes"]}) for c in cfgs]
+    series = [(c, {x["class"]: (x["iou"], x["iou_ci"]) for x in a3["mine"][c]["classes"]},
+               {x["class"]: x["evaluable"] for x in a3["mine"][c]["classes"]}) for c in cfgs]
     if a3["mauricio"]:
-        series.append(("Mauricio (otro dataset)", {n: (v, None) for n, v in a3["mauricio"]["iou"].items()}))
+        series.append(("Mauricio (otro dataset)", {n: (v, None) for n, v in a3["mauricio"]["iou"].items()},
+                       dict(a3["mauricio"]["evaluable"])))
     rows = [{"serie": s, "clase": n, "iou_pct": _pct(d.get(n, (None, None))[0]),
              "ic_lo_pct": _pct((d.get(n, (None, None))[1] or [None, None])[0]),
-             "ic_hi_pct": _pct((d.get(n, (None, None))[1] or [None, None])[1])} for s, d in series for n in common]
+             "ic_hi_pct": _pct((d.get(n, (None, None))[1] or [None, None])[1]), "evaluable": e.get(n)}
+            for s, d, e in series for n in common]
     fig, ax = plt.subplots(figsize=(1.2 + 0.95 * len(common), 3.6))
     w = 0.8 / len(series)
-    for k, (s, d) in enumerate(series):
+    for k, (s, d, e) in enumerate(series):
         xs = np.arange(len(common)) - 0.4 + w * (k + 0.5)
         ys = np.array([_pct(d.get(n, (None, None))[0]) for n in common], float)
         mau = s.startswith("Mauricio")
         ax.bar(xs, np.nan_to_num(ys), width=w * 0.9, color="white" if mau else config_color(s),
                edgecolor=INK if mau else "none", hatch="////" if mau else None, linewidth=0.8, label=s)
+        for xi, yi, n in zip(xs, ys, common):
+            if not e.get(n, True):
+                ax.text(xi, np.nan_to_num(yi) + 1.5, "*", ha="center", fontsize=9, color=INK)
     ax.set_xticks(range(len(common)), common, rotation=30, ha="right")
     ax.set_ylabel("IoU (%)")
     ax.set_ylim(0, 100)
     ax.grid(axis="x", visible=False)
     ax.legend(ncol=min(4, len(series)), loc="upper center", bbox_to_anchor=(0.5, -0.32), fontsize=7.5)
-    ax.set_title("Esquema común: Pascual frente a Mauricio (datasets distintos)", loc="left")
+    ax.set_title("Esquema común: Pascual frente a Mauricio (datasets distintos; * = no evaluable)", loc="left")
     return _save(fig, rows, out, "A3_esquema_comun")
 
 
