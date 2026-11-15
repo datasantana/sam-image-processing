@@ -223,7 +223,10 @@ def test_repo_mapping_is_approved_with_sensitivity_variants():
     assert A.evaluability_rule({}, K=99) == {"min_photos": 5, "min_pixel_share_pct": None, "exclude": {},
                                              "mauricio_exclude": {}}
     assert "no concluyente" in m["footnotes"]["mauricio"]["agua"] and "sin IC" in m["footnotes"]["mauricio"]["agua"]
-    assert set(v) == {"sports_fields_fuera", "sin_clase_descartado", "sin_agua"}
+    assert set(v) == {"sports_fields_fuera", "sin_clase_descartado", "umbral_pixeles_0_1", "sin_agua"}
+    assert v["umbral_pixeles_0_1"]["evaluability"]["min_pixel_share_pct"] == 0.1
+    assert v["umbral_pixeles_0_1"]["evaluability"]["min_photos"] == 5
+    assert any("después de ver los datos" in " ".join(t.split()) for t in m["report_notes"])
     assert list(v["sin_agua"]["evaluability"]["exclude"]) == ["agua"]
     assert v["sin_agua"]["evaluability"]["min_photos"] == 5
     assert "LEEME" in next(x for x in m["variants"] if x["name"] == "sin_agua")["description"]

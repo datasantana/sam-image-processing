@@ -547,6 +547,7 @@ def _a3_core(runs: list[Run], classes: list[str], mapping: dict, mau: Optional[d
     check_mapping_covers(mapping, "mine", classes)
     out = {"common": common, "policy": pol, "rule": rule, "mine": {}, "mauricio": None,
            "footnotes": {side: dict((mapping.get("footnotes") or {}).get(side) or {}) for side in ("mine", "mauricio")},
+           "report_notes": [" ".join(str(t).split()) for t in (mapping.get("report_notes") or [])],
            "mapping_mine": dict(mapping["mine"]), "mapping_mauricio": dict(mapping["mauricio"])}
 
     # --- Mauricio (matriz agregada: soporte por píxeles y, si su xlsx lo declara, por fotos)
@@ -1057,6 +1058,7 @@ def to_report(R: dict, out: Path) -> str:
               "La matriz de Mauricio es agregada (no hay matrices por foto): su columna no tiene IC.", ""]
         L += ["", f"Criterio de clase evaluable (ambos lados): {_rule_text(a3['rule'])}. Mauricio no tiene matrices por "
               "foto: el nº de fotos solo se conoce cuando su xlsx lo declara.", ""]
+        L += [f"> {t}" for t in a3.get("report_notes", [])] + ([""] if a3.get("report_notes") else [])
         if a3["mauricio"] and a3["mauricio"]["photos_stated"]:
             L += ["Nº de fotos de prueba declarado en su xlsx (hoja LEEME): " + ", ".join(
                 f"{k}: {v}" for k, v in a3["mauricio"]["photos_stated"].items() if v is not None)
