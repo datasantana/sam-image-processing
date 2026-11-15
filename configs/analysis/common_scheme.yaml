@@ -32,9 +32,8 @@ evaluability:
 # Notas que REPORT.md copia en la sección A3, después del criterio.
 report_notes:
   - >-
-    El umbral de píxeles (≥ 0.1 % de los píxeles etiquetados del esquema común) se propuso después de ver los
-    datos (el agua de Mauricio tiene 0.049 %); por eso no es el criterio principal y solo aparece como análisis
-    de sensibilidad (variante umbral_pixeles_0_1).
+    Se consideró un umbral de píxeles (≥ 0.1 % de los píxeles etiquetados del esquema común) y se descartó por
+    haberse propuesto después de ver los datos.
 
 # Notas al pie de la tabla principal, por lado y clase común.
 footnotes:
@@ -89,13 +88,6 @@ variants:
       Lo que el modelo de Mauricio predijo como sin_clase sobre píxeles etiquetados se descarta en vez de
       contar como error.
     unmapped_prediction: {mauricio: drop}
-  - name: umbral_pixeles_0_1
-    description: >-
-      Regla de ≥ 5 fotos más un umbral de píxeles: la clase debe tener ≥ 0.1 % de los píxeles etiquetados del
-      esquema común, en ambos lados. Con los datos actuales solo saca el agua de Mauricio (0.049 %; mIoU (a) de
-      Mauricio 78.5); en Pascual ninguna clase común baja de 0.77 %. El umbral se propuso después de ver los
-      datos, por eso es sensibilidad y no el criterio principal.
-    evaluability: {min_pixel_share_pct: 0.1}
   - name: sin_agua
     description: >-
       Agua fuera del mIoU en ambos lados (sus píxeles siguen en la matriz y en la OA). Justificación: la hoja
