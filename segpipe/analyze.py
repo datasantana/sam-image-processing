@@ -1033,12 +1033,17 @@ def to_report(R: dict, out: Path) -> str:
               f"| ρ(Δcobertura, Δn_train) | {_f(pair['rho_dcov_dntrain'], 2)} | — |",
               f"| r de Pearson(Δcobertura, Δn_train) | {_f(pair['pearson_dcov_dntrain'], 2)} | — |",
               f"| Valores distintos de Δn_train | {pair['n_valores_distintos_dntrain']} | — |", "",
-              f"MCO ΔIoU ~ 1 + Δcobertura + Δn_train (rango de la matriz de diseño = {o['rank']}; IC por bootstrap de fotos):", "",
+              f"MCO ΔIoU ~ 1 + Δcobertura + Δn_train (rango de la matriz de diseño = {o['rank']}; IC por bootstrap de fotos). "
+              "Unidades: ΔIoU en pp; Δcobertura en pp; Δn_train en fotos.", "",
               "| Término | Coeficiente | IC 95 % |", "|---|---|---|"]
+        units = {"intercepto": "pp", "d_cov": "pp de IoU por pp de cobertura", "d_n_train": "pp de IoU por foto de train"}
         for k in ("intercepto", "d_cov", "d_n_train"):
-            L.append(f"| {k} | {o['coef'][k]:+.5f} | {_ci(o['ci'][k], 5)} |")
-        L += ["", "Δn_train solo toma tantos valores como pliegues; su efecto no se distingue de cualquier otra diferencia "
-              "entre pliegues. La fila \"dentro de pliegue\" mantiene Δn_train fijo."]
+            lo, hi = (100 * v for v in o["ci"][k])
+            L.append(f"| {k} ({units[k]}) | {100 * o['coef'][k]:+.3f} | [{lo:+.3f}, {hi:+.3f}] |")
+        n_folds = len(pair["folds"])
+        L += ["", f"Δn_train es constante dentro de cada pliegue y toma {pair['n_valores_distintos_dntrain']} valores "
+              f"distintos en {n_folds} pliegues; su efecto no se distingue de cualquier otra diferencia entre pliegues. "
+              "La fila \"dentro de pliegue\" mantiene Δn_train fijo."]
 
     # A3
     L += ["", "## 5. A3 — Esquema común con Mauricio", "", f"Estado: {R['a3_status']}."]

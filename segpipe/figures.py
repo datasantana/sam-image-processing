@@ -190,7 +190,7 @@ def fig_confusion(runs, classes: list[str], out: Path, configs=("J0", "J1", "M-b
             ax.set_ylabel("Clase real")
         ax.set_title(f"{c} (% de cada fila)", loc="left")
     fig.suptitle("Matrices de confusión normalizadas por fila (test agrupado)", x=0.01, ha="left", fontsize=10)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     return _save(fig, rows, out, "A4_matrices_confusion")
 
 
@@ -277,7 +277,9 @@ def fig_a2_pair(pair: dict, out: Path):
     for ax in axes:
         ax.axhline(0, color=INK2, lw=0.8)
     axes[0].set_xlabel("Δ cobertura de la huella (pp)")
-    axes[1].set_xlabel("Δ fotos de train del pliegue")
+    axes[1].set_xlabel("Δ fotos de train del pliegue\n(desplazamiento horizontal solo visual)")
+    dn = sorted({int(round(r["d_n_train"])) for r in rows})
+    axes[1].set_xticks(dn)
     axes[0].set_ylabel("Δ IoU de la foto (pp)")
     axes[0].set_title(f"ρ = {pair['rho_diou_dcov']:.2f}", loc="left", fontsize=9)
     axes[1].set_title(f"ρ = {pair['rho_diou_dntrain']:.2f}", loc="left", fontsize=9)
