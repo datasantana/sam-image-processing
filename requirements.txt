@@ -23,8 +23,10 @@ albumentations>=1.4
 google-api-python-client>=2.0
 google-auth>=2.0
 
-# Gráficas
+# Gráficas y análisis posterior (python -m segpipe.analyze; no necesita torch)
 matplotlib>=3.7
+scipy>=1.10
+openpyxl>=3.1      # leer el xlsx de Mauricio
 
 # Pruebas
 pytest>=7.0
