@@ -330,3 +330,38 @@ def test_end_to_end_stops_when_verification_fails(tmp_path):
     out = tmp_path / "pred" / "J0"
     assert (out / "verificacion_oof.json").exists()
     assert not (out / "masks_rgb").exists()                   # el ensamble no arrancó
+
+
+# ----------------------------------------------------------------------------- GPU
+
+@pytest.mark.parametrize("name,cap", [("NVIDIA A100-SXM4-40GB", (8, 0)), ("NVIDIA A100 80GB PCIe", (8, 0)),
+                                      ("NVIDIA H100 80GB HBM3", (9, 0)), ("NVIDIA L4", (8, 9))])
+def test_check_gpu_accepts_a100_h100_l4(name, cap):
+    info = P.check_gpu(name, cap)
+    assert info["gpu"] == name and info["bf16_nativo"] and info["compute_capability"] == f"{cap[0]}.{cap[1]}"
+
+
+@pytest.mark.parametrize("name,cap,msg", [("Tesla T4", (7, 5), "no admitida"), ("NVIDIA T4", (8, 0), "no admitida"),
+                                          ("NVIDIA L40S", (8, 9), "no admitida"), ("Tesla V100-SXM2-16GB", (7, 0), "no admitida"),
+                                          ("NVIDIA A100-SXM4-40GB", (7, 5), "sin bf16 nativo"),
+                                          (None, None, "No hay GPU")])
+def test_check_gpu_blocks_t4_and_non_native_bf16(name, cap, msg):
+    with pytest.raises(P.PredictError, match=msg):
+        P.check_gpu(name, cap)
+
+
+def test_gpu_recorded_in_manifest_and_models_json(tmp_path):
+    photos = write_photos(tmp_path / "fotos", ["a", "b"])
+    vals = {f: [5.0, 0.0, 0.0] for f in range(5)}
+    out = tmp_path / "out" / "J1"
+    P.predict_config("J1", members(), photos, {"a": 0}, out, PAL, NAMES, CPU, None, staging=tmp_path / "stg",
+                     logits_fn=const_logits(vals), gpu="NVIDIA L4", log=lambda *a: None)
+    import csv
+    rows = list(csv.DictReader(open(P.write_manifest(out, P.Progress(out), NAMES), encoding="utf-8")))
+    assert {r["gpu"] for r in rows} == {"NVIDIA L4"} and len(rows) == 3
+    g1 = P.check_gpu("NVIDIA L4", (8, 9))
+    P.write_models_json(out, "J1", members(), {"amp": "torch.bfloat16"}, g1)
+    P.write_models_json(out, "J1", members(), {"amp": "torch.bfloat16"}, P.check_gpu("NVIDIA A100-SXM4-40GB", (8, 0)))
+    mj = json.loads((out / "models.json").read_text(encoding="utf-8"))
+    assert [s["gpu"] for s in mj["sesiones"]] == ["NVIDIA L4", "NVIDIA A100-SXM4-40GB"]
+    assert all(s["bf16_nativo"] for s in mj["sesiones"]) and len(mj["modelos"]) == 5

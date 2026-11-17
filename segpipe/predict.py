@@ -25,6 +25,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -211,12 +212,43 @@ class Member:
     test: list = field(default_factory=list)
 
 
+ALLOWED_GPUS = ("A100", "H100", "L4")
+MIN_BF16_CAPABILITY = (8, 0)      # bf16 nativo desde Ampere (sm_80); la T4 es sm_75
+
+
+def check_gpu(name: Optional[str], capability: Optional[tuple[int, int]]) -> dict:
+    """Acepta A100, H100 y L4 con bf16 nativo (compute capability ≥ 8.0); bloquea la T4 y cualquier otra.
+
+    No se usa ``torch.cuda.is_bf16_supported()``: en una T4 devolvió True (bf16 emulado)."""
+    cap = tuple(capability) if capability else None
+    native = bool(cap and cap >= MIN_BF16_CAPABILITY)
+    info = {"gpu": name, "compute_capability": ".".join(map(str, cap)) if cap else None, "bf16_nativo": native}
+    if not name:
+        raise PredictError("No hay GPU CUDA. Se necesita A100, H100 o L4.")
+    tokens = set(re.split(r"[\s\-_/]+", name.upper()))      # "NVIDIA A100-SXM4-40GB" → {NVIDIA, A100, SXM4, 40GB}
+    if "T4" in tokens or not tokens & set(ALLOWED_GPUS):      # por palabra: "L40S" no cuenta como "L4"
+        raise PredictError(f"GPU no admitida: {name}. Se acepta A100, H100 o L4 (en T4 hay un fallo de cuDNN sin resolver).")
+    if not native:
+        raise PredictError(f"{name} sin bf16 nativo (compute capability {info['compute_capability']} < 8.0).")
+    return info
+
+
+def gpu_status(device=None) -> dict:
+    """Nombre y compute capability de la GPU actual, verificados con ``check_gpu``."""
+    import torch
+    if not torch.cuda.is_available():
+        return check_gpu(None, None)
+    i = (device.index or 0) if device is not None and device.type == "cuda" else 0
+    return check_gpu(torch.cuda.get_device_name(i), torch.cuda.get_device_capability(i))
+
+
 def amp_dtype_for(device):
-    """Misma regla que el entrenamiento/evaluación: bf16 si la GPU lo admite, si no fp16; en CPU, sin AMP."""
+    """bf16 en GPU con bf16 nativo (compute capability ≥ 8.0, como la A100 de la CV), si no fp16; en CPU, sin AMP."""
     import torch
     if device.type != "cuda":
         return None
-    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    cap = torch.cuda.get_device_capability(device.index or 0)
+    return torch.bfloat16 if tuple(cap) >= MIN_BF16_CAPABILITY else torch.float16
 
 
 def load_members(study_dir: str | Path, config: str, class_names: list[str], device, seed: int = 42,
@@ -393,7 +425,8 @@ def predict_config(config: str, members: list[Member], photos: dict[str, Path], 
                    out_dir: str | Path, palette: np.ndarray, class_names: list[str], device, amp_dtype,
                    versions: Iterable[str] = ("oof", "ensamble"), mask_fn: Optional[Callable] = None,
                    staging: Optional[str | Path] = None, limit: Optional[int] = None, writers: int = 3,
-                   logits_fn: Callable = member_logits, log: Callable = print) -> list[dict]:
+                   logits_fn: Callable = member_logits, gpu: Optional[str] = None,
+                   log: Callable = print) -> list[dict]:
     """Predice y escribe; salta lo ya hecho (reanudable). ``mask_fn(nombre)`` → máscara índice (255 = ignorar)
     para guardar la matriz de confusión de la versión ``oof``. Devuelve las filas nuevas."""
     out_dir = Path(out_dir)
@@ -434,7 +467,7 @@ def predict_config(config: str, members: list[Member], photos: dict[str, Path], 
                 raise PredictError(f"{name}: predicción {pred.shape} ≠ foto {image.shape[:2]}")
             sfx = VERSIONS[version]
             row = {"foto": name, "version": version, "etiquetada": name in labelled,
-                   "pliegue_test": labelled.get(name, ""), "modelos": model_tag(config, used),
+                   "pliegue_test": labelled.get(name, ""), "modelos": model_tag(config, used), "gpu": gpu or "",
                    "archivos": ";".join(f"{k}{sfx}/{name}.png" for k in KINDS),
                    "segundos_inferencia": round(time.perf_counter() - t0, 3),
                    **photo_stats(pred, conf, class_names)}
@@ -515,7 +548,7 @@ def write_manifest(out_dir: str | Path, prog: Progress, class_names: list[str]) 
         versions_of.setdefault(r["foto"], []).append(r["version"])
     cols = (["foto", "version", "etiquetada", "pliegue_test", "versiones_disponibles", "modelos", "archivos",
              "conf_media"] + [f"frac_conf_lt_{t}" for t in CONF_THRESHOLDS] + [f"pct_{c}" for c in class_names]
-            + ["segundos_inferencia", "segundos_escritura"])
+            + ["gpu", "segundos_inferencia", "segundos_escritura"])
     p = Path(out_dir) / "predictions_manifest.csv"
     with open(p, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -525,10 +558,15 @@ def write_manifest(out_dir: str | Path, prog: Progress, class_names: list[str]) 
     return p
 
 
-def write_models_json(out_dir: str | Path, config: str, members: list[Member], extra: Optional[dict] = None) -> Path:
+def write_models_json(out_dir: str | Path, config: str, members: list[Member], extra: Optional[dict] = None,
+                      gpu: Optional[dict] = None) -> Path:
+    """``models.json``; ``gpu`` se añade a ``sesiones`` (una entrada por sesión, se conservan las anteriores)."""
     p = Path(out_dir) / "models.json"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"config": config, **(extra or {}), "modelos": [
+    sessions = json.loads(p.read_text(encoding="utf-8")).get("sesiones", []) if p.exists() else []
+    if gpu:
+        sessions.append({**gpu, "inicio": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    p.write_text(json.dumps({"config": config, **(extra or {}), "sesiones": sessions, "modelos": [
         {"pliegue": m.fold, "run_dir": str(m.run_dir), "best_pt_sha256": m.ckpt_sha256, "mejor_epoca": m.best_epoch,
          "infer": m.cfg.get("infer"), "fotos_test": m.test} for m in members]}, indent=1, ensure_ascii=False),
         encoding="utf-8")
@@ -676,9 +714,11 @@ def run_config(config: str, study_dir: str | Path, photos: dict[str, Path], labe
     amp = amp_dtype_for(device)
     if min_photos is None:                     # el mismo K que usó la evaluación de la CV
         min_photos = int(members[0].cfg.get("eval", {}).get("min_photos", 5))
-    write_models_json(out_dir, config, members, {"amp": str(amp), "n_fotos": len(photos)})
+    gpu = gpu_status(device) if device.type == "cuda" else None
+    gpu_name = gpu["gpu"] if gpu else str(device)
+    write_models_json(out_dir, config, members, {"amp": str(amp), "n_fotos": len(photos)}, gpu)
     predict_config(config, members, photos, labelled, out_dir, palette, names, device, amp, ("oof",),
-                   mask_fn=mask_fn, staging=staging, log=log)
+                   mask_fn=mask_fn, staging=staging, gpu=gpu_name, log=log)
     prog = Progress(out_dir)
     ver = verify_oof(prog.of("oof"), load_cv_cms(study_dir, config, seed), names, min_photos, tol_pp,
                      summary_miou(study_dir, config))
@@ -689,7 +729,7 @@ def run_config(config: str, study_dir: str | Path, photos: dict[str, Path], labe
     if not ver["passed"]:
         raise PredictError(f"{config}: la verificación fuera de pliegue no pasa (Δ {ver['delta_pp']:+.3f} pp)")
     predict_config(config, members, photos, labelled, out_dir, palette, names, device, amp, ("ensamble",),
-                   staging=staging, log=log)
+                   staging=staging, gpu=gpu_name, log=log)
     prog = Progress(out_dir)
     man = write_manifest(out_dir, prog, names)
     zips = make_zips(out_dir, len(photos), n_oof if n_oof is not None else len(labelled), staging)
