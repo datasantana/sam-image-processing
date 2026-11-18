@@ -365,3 +365,84 @@ def test_gpu_recorded_in_manifest_and_models_json(tmp_path):
     mj = json.loads((out / "models.json").read_text(encoding="utf-8"))
     assert [s["gpu"] for s in mj["sesiones"]] == ["NVIDIA L4", "NVIDIA A100-SXM4-40GB"]
     assert all(s["bf16_nativo"] for s in mj["sesiones"]) and len(mj["modelos"]) == 5
+
+
+# ----------------------------------------------------------------------------- por pliegue
+
+def run_per_fold(tmp_path, labelled, limit=None, photos=None, oof_dir=None):
+    photos = photos or write_photos(tmp_path / "fotos", ["a", "b", "c"])
+    vals = {f: [0.0] * 3 for f in range(5)}
+    for f in range(5):
+        vals[f][f % 3] = 5.0 + f                         # pliegue f → clase f % 3
+    rows = P.predict_per_fold("M-b3", members(), photos, tmp_path / "out" / "per_fold", NAMES, CPU, None,
+                              labelled=labelled, oof_dir=oof_dir, staging=tmp_path / "stg", limit=limit,
+                              logits_fn=const_logits(vals), log=lambda *a: None)
+    return photos, rows
+
+
+def test_per_fold_outputs_one_model_each(tmp_path):
+    photos, rows = run_per_fold(tmp_path, {"a": 2})
+    out = tmp_path / "out" / "per_fold"
+    assert len(rows) == 15 and {r["version"] for r in rows} == {f"fold{f}" for f in range(5)}
+    for f in range(5):
+        idx = np.asarray(Image.open(out / f"fold{f}" / "masks_index" / "b.png"))
+        assert set(np.unique(idx)) == {f % 3}
+        cf = Image.open(out / f"fold{f}" / "conf" / "b.png")
+        assert cf.size == (W // 4, H // 4)
+        assert not (out / f"fold{f}" / "masks_rgb").exists()
+    by = {(r["foto"], r["pliegue"]): r for r in rows}
+    assert by[("a", 2)]["es_test_de_este_pliegue"] and not by[("a", 1)]["es_test_de_este_pliegue"]
+    assert by[("a", 2)]["modelos"] == "M-b3/fold2"
+    assert [r["foto"] for r in rows[:5]] == ["a"] * 5               # etiquetadas primero
+
+
+def test_per_fold_matches_oof_and_compares(tmp_path):
+    labelled = {"a": 2, "b": 4}
+    photos, _ = run_predict(tmp_path, labelled, versions=("oof",))
+    _, rows = run_per_fold(tmp_path, labelled, photos=photos, oof_dir=tmp_path / "out" / "J1")
+    by = {(r["foto"], r["pliegue"]): r for r in rows}
+    assert by[("a", 2)]["px_distintos_vs_oof"] == 0 and by[("b", 4)]["px_distintos_vs_oof"] == 0
+    assert "px_distintos_vs_oof" not in by[("a", 1)] and "px_distintos_vs_oof" not in by[("c", 0)]
+    out = tmp_path / "out"
+    a_fold = np.asarray(Image.open(out / "per_fold" / "fold2" / "masks_index" / "a.png"))
+    a_oof = np.asarray(Image.open(out / "J1" / "masks_index_oof" / "a.png"))
+    assert (a_fold == a_oof).all()
+    rep = P.verify_per_fold(out / "per_fold", range(5), photos)
+    assert rep["pliegues"][2]["px_distintos_vs_oof_max"] == 0 and rep["pliegues"][0]["fotos"] == 3
+
+
+def test_per_fold_resume_and_verify_missing(tmp_path):
+    photos, rows1 = run_per_fold(tmp_path, {}, limit=1)
+    assert {r["foto"] for r in rows1} == {"a"} and len(rows1) == 5
+    _, rows2 = run_per_fold(tmp_path, {}, photos=photos)
+    assert sorted({r["foto"] for r in rows2}) == ["b", "c"] and len(rows2) == 10
+    _, rows3 = run_per_fold(tmp_path, {}, photos=photos)
+    assert rows3 == []
+    out = tmp_path / "out" / "per_fold"
+    (out / "fold3" / "conf" / "c.png").unlink()                     # un archivo perdido → solo ese par
+    with pytest.raises(P.PredictError, match="fold3: faltan 1"):
+        P.verify_per_fold(out, range(5), photos)
+    with open(out / "fold1" / "progress.jsonl", "a", encoding="utf-8") as f:
+        f.write('{"foto": "c", "vers')                              # última línea a medias
+    _, rows4 = run_per_fold(tmp_path, {}, photos=photos)
+    assert [(r["foto"], r["pliegue"]) for r in rows4] == [("c", 3)]
+    assert P.verify_per_fold(out, range(5), photos)["problemas"] == []
+
+
+def test_verify_per_fold_flags_oof_mismatch(tmp_path):
+    labelled = {"a": 2}
+    photos, _ = run_predict(tmp_path, labelled, versions=("oof",))
+    oof = tmp_path / "out" / "J1" / "masks_index_oof" / "a.png"
+    arr = np.asarray(Image.open(oof)).copy()
+    arr[:10, :10] = 0
+    Image.fromarray(arr).save(oof)
+    run_per_fold(tmp_path, labelled, photos=photos, oof_dir=tmp_path / "out" / "J1")
+    with pytest.raises(P.PredictError, match="difieren de _oof"):
+        P.verify_per_fold(tmp_path / "out" / "per_fold", range(5), photos, max_px_vs_oof=50)
+
+
+def test_estimate_per_fold_hours():
+    rows = [{"segundos_inferencia": 9.0, "segundos_escritura": 9.0}] * 5 + \
+           [{"segundos_inferencia": 1.0, "segundos_escritura": 0.6}] * 10
+    e = P.estimate_per_fold_hours(rows, n_photos=961, n_folds=5)
+    assert e["s_por_foto_y_pliegue"] == 1.0 and abs(e["horas"] - 961 * 5 / 3600) < 1e-9
