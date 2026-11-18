@@ -486,6 +486,133 @@ def predict_config(config: str, members: list[Member], photos: dict[str, Path], 
     return new_rows
 
 
+# ----------------------------------------------------------------------------- predicción por pliegue
+
+PER_FOLD_KINDS = ("masks_index", "conf")
+
+
+def per_fold_paths(out_dir: str | Path, fold: int, name: str) -> dict[str, Path]:
+    """``<out>/fold<k>/{masks_index,conf}/<nombre>.png``."""
+    return {k: Path(out_dir) / f"fold{fold}" / k / f"{name}.png" for k in PER_FOLD_KINDS}
+
+
+class FoldProgress(Progress):
+    """``fold<k>/progress.jsonl``: una fila por foto, escrita después de sus 2 archivos."""
+
+    def __init__(self, out_dir: str | Path, fold: int):
+        super().__init__(Path(out_dir) / f"fold{fold}")
+        self.fold = fold
+        self.root = Path(out_dir)
+        self.rows = {(n, v): r for (n, v), r in self.rows.items() if v == f"fold{fold}"}
+
+    def done(self, name: str, version: Optional[str] = None) -> bool:
+        return ((name, f"fold{self.fold}") in self.rows
+                and all(p.exists() for p in per_fold_paths(self.root, self.fold, name).values()))
+
+
+def predict_per_fold(config: str, members: list[Member], photos: dict[str, Path], out_dir: str | Path,
+                     class_names: list[str], device, amp_dtype, labelled: Optional[dict[str, int]] = None,
+                     oof_dir: Optional[str | Path] = None, staging: Optional[str | Path] = None,
+                     limit: Optional[int] = None, writers: int = 3, logits_fn: Callable = member_logits,
+                     gpu: Optional[str] = None, log: Callable = print) -> list[dict]:
+    """Cada modelo de pliegue por separado sobre todas las fotos (para votar sin fuga entre pliegues).
+
+    Por foto se lee la imagen una vez y se infiere con cada pliegue pendiente: pred = argmax de sus logits y
+    conf = max softmax (igual que ``oof``). Salida ``<out_dir>/fold<k>/{masks_index,conf}/`` y
+    ``fold<k>/progress.jsonl``; reanudable por (foto, pliegue). Si ``oof_dir`` tiene ``masks_index_oof``, para
+    las etiquetadas en su pliegue de test se guarda ``px_distintos_vs_oof`` (debe ser ~0: es la misma inferencia).
+    ``limit`` cuenta fotos. Devuelve las filas nuevas."""
+    out_dir = Path(out_dir)
+    labelled = labelled or {}
+    staging = Path(staging or tempfile.gettempdir()) / f"segpipe_perfold_{config}"
+    progs = {m.fold: FoldProgress(out_dir, m.fold) for m in members}
+    names = sorted(photos, key=lambda n: (n not in labelled, n))        # etiquetadas primero
+    todo = [n for n in names if any(not progs[m.fold].done(n) for m in members)]
+    log(f"{config} por pliegue: {len(todo)} fotos con algún pliegue pendiente, {len(names) - len(todo)} completas")
+    if limit is not None:
+        todo = todo[:limit]
+    new_rows: list[dict] = []
+
+    def write_job(fold, name, pred, conf, row):
+        t = time.perf_counter()
+        paths = per_fold_paths(out_dir, fold, name)
+        write_png(pred, paths["masks_index"], staging)
+        write_png(conf_to_png(conf), paths["conf"], staging)
+        row["segundos_escritura"] = round(time.perf_counter() - t, 3)
+        progs[fold].append(row)
+        return row
+
+    pending = []
+    with ThreadPoolExecutor(max_workers=writers) as pool:
+        for i, name in enumerate(todo):
+            image = load_image(photos[name])
+            for m in members:
+                if progs[m.fold].done(name):
+                    continue
+                t0 = time.perf_counter()
+                pred, conf = predict_photo([m], image, device, amp_dtype, logits_fn)
+                if pred.shape != image.shape[:2]:
+                    raise PredictError(f"{name}: predicción {pred.shape} ≠ foto {image.shape[:2]}")
+                row = {"foto": name, "version": f"fold{m.fold}", "pliegue": m.fold,
+                       "etiquetada": name in labelled, "pliegue_test": labelled.get(name, ""),
+                       "es_test_de_este_pliegue": labelled.get(name) == m.fold,
+                       "modelos": model_tag(config, [m]), "gpu": gpu or "",
+                       "archivos": ";".join(f"fold{m.fold}/{k}/{name}.png" for k in PER_FOLD_KINDS),
+                       "segundos_inferencia": round(time.perf_counter() - t0, 3),
+                       **photo_stats(pred, conf, class_names)}
+                if oof_dir is not None and labelled.get(name) == m.fold:
+                    p = Path(oof_dir) / "masks_index_oof" / f"{name}.png"
+                    if p.exists():
+                        from PIL import Image
+                        with Image.open(p) as im:
+                            ref = np.asarray(im)
+                        row["px_distintos_vs_oof"] = int((ref != pred).sum())
+                pending.append(pool.submit(write_job, m.fold, name, pred, conf, row))
+                while len(pending) > writers + 1:
+                    new_rows.append(pending.pop(0).result())
+            if (i + 1) % 50 == 0 or i + 1 == len(todo):
+                log(f"  {config} por pliegue: {i + 1}/{len(todo)} fotos")
+        for f in pending:
+            new_rows.append(f.result())
+    return new_rows
+
+
+def verify_per_fold(out_dir: str | Path, folds: Iterable[int], photos: Iterable[str],
+                    max_px_vs_oof: int = 1000) -> dict:
+    """Comprueba que cada pliegue tenga las 2 salidas de todas las fotos y resume ``px_distintos_vs_oof``.
+    Lanza PredictError si falta algo o si alguna etiquetada difiere de su ``_oof`` en más de ``max_px_vs_oof``
+    píxeles (la verificación de la fase B toleró hasta 911 px por no determinismo de la GPU)."""
+    photos = sorted(photos)
+    rep, problems = {"pliegues": {}}, []
+    for f in folds:
+        prog = FoldProgress(out_dir, f)
+        missing = [n for n in photos if not prog.done(n)]
+        diffs = {r["foto"]: r["px_distintos_vs_oof"] for r in prog.rows.values() if "px_distintos_vs_oof" in r}
+        rep["pliegues"][f] = {"fotos": len(photos) - len(missing), "faltan": missing[:10],
+                              "etiquetadas_comparadas_con_oof": len(diffs),
+                              "px_distintos_vs_oof_max": max(diffs.values()) if diffs else None}
+        if missing:
+            problems.append(f"fold{f}: faltan {len(missing)} fotos: {missing[:5]}")
+        bad = {n: d for n, d in diffs.items() if d > max_px_vs_oof}
+        if bad:
+            problems.append(f"fold{f}: {len(bad)} etiquetadas difieren de _oof en > {max_px_vs_oof} px: {bad}")
+    rep["problemas"] = problems
+    if problems:
+        raise PredictError("Verificación por pliegue fallida:\n  - " + "\n  - ".join(problems))
+    return rep
+
+
+def estimate_per_fold_hours(rows: list[dict], n_photos: int = EXPECTED_N, n_folds: int = 5, writers: int = 3) -> dict:
+    """Horas estimadas con las medianas de la corrida de humo (sin las 5 primeras filas: calentamiento).
+    Por (foto, pliegue) cuenta max(inferencia, escritura / nº de escritores)."""
+    xs = rows[n_folds:] if len(rows) > n_folds else rows
+    inf = float(np.median([r["segundos_inferencia"] for r in xs])) if xs else float("nan")
+    wr = float(np.median([r["segundos_escritura"] for r in xs])) if xs else float("nan")
+    per = max(inf, wr / writers)
+    return {"s_inferencia": inf, "s_escritura": wr, "s_por_foto_y_pliegue": per,
+            "horas": per * n_photos * n_folds / 3600}
+
+
 # ----------------------------------------------------------------------------- verificación fuera de pliegue
 
 def load_cv_cms(study_dir: str | Path, config: str, seed: int = 42) -> dict[str, np.ndarray]:
